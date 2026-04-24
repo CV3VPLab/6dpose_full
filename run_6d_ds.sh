@@ -35,12 +35,12 @@ DEVICE="cuda"
 # ---------------------
 # Step 0 – DS prep settings
 # ---------------------
-QUERY_IMG_ORIG="data/query_0408/q2_00044.jpg"
-INTRINSICS_PATH_ORIG="data/can_data/intrinsics_4k.txt"
+QUERY_IMG_ORIG="data/query_img/q2_00044.jpg"
+INTRINSICS_PATH_ORIG="data/intrinsics_4k.txt"
 
 # Paths for the downsampled query image and scaled intrinsics
-QUERY_IMG_DS="data/query_0408/q2_00044_ds.jpg"
-INTRINSICS_PATH_DS="data/can_data/intrinsics_ds.txt"
+QUERY_IMG_DS="data/query_img/q2_00044_ds.jpg"
+INTRINSICS_PATH_DS="data/intrinsics_ds.txt"
 
 # # ---------------------
 # # Step 0 – DS prep settings

@@ -1,24 +1,7 @@
-#!/bin/bash
-# =============================================================================
-# setup_full.sh  —  6dpose_gs conda environment
-#
-# 현재 실제 동작 환경 기준 (2026-04-24)
-#
-# 포함:
-#   - PyTorch 2.5.1+cu118  (Python 3.10)
-#   - YOLO, SAM2 (git clone), DINOv2, LoFTR (kornia), timm
-#   - gsplat 1.5.3
-#   - diff-gaussian-rasterization, simple-knn, fused-ssim (local submodules)
-#   - scipy, h5py, plyfile, lpips 등
-#
-# Usage:
-#   bash setup_full.sh
-# =============================================================================
-
 set -e
 
-ENV_NAME="6dpose_gs"
-REPO_DIR="$HOME/6dpose_full"
+ENV_NAME="6dpose_test"
+REPO_DIR="$HOME/6dpose_pipeline"
 SAM2_DIR="$REPO_DIR/sam2_repo"
 
 CONDA_BASE="$(conda info --base)"
@@ -34,9 +17,7 @@ echo "============================================================"
 # ── 1. conda env ──────────────────────────────────────────────────────────────
 echo ""
 echo ">>> [1/7] Creating conda env '$ENV_NAME' ..."
-source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda create -n "$ENV_NAME" python=3.10 -y
-conda activate "$ENV_NAME"
 
 # ── 2. PyTorch ────────────────────────────────────────────────────────────────
 echo ""
@@ -98,41 +79,57 @@ fi
 # ── 6. gsplat + GS CUDA submodules ───────────────────────────────────────────
 echo ""
 echo ">>> [6/7] gsplat + GS CUDA submodules ..."
+export TORCH_CUDA_ARCH_LIST="8.6"
 "$PIP" install --upgrade setuptools wheel
 
 # gsplat: PyPI 패키지 — 경로 불필요
 echo "    gsplat 1.5.3 ..."
 "$PIP" install gsplat==1.5.3
 
-# CUDA submodules: 각자 git repo에서 clone 후 build
+# CUDA submodules: 항상 새로 clone 후 build
 mkdir -p "$REPO_DIR/submodules"
 
+echo "    Removing old GS CUDA submodules ..."
+rm -rf "$REPO_DIR/submodules/diff-gaussian-rasterization"
+rm -rf "$REPO_DIR/submodules/simple-knn"
+rm -rf "$REPO_DIR/submodules/fused-ssim"
+
 echo "    diff-gaussian-rasterization ..."
-if [ ! -d "$REPO_DIR/submodules/diff-gaussian-rasterization" ]; then
-    git clone --recursive--branch dr_aa \
-        https://github.com/graphdeco-inria/diff-gaussian-rasterization.git \
-        "$REPO_DIR/submodules/diff-gaussian-rasterization"
-fi
+git clone --recursive --branch dr_aa \
+    https://github.com/graphdeco-inria/diff-gaussian-rasterization.git \
+    "$REPO_DIR/submodules/diff-gaussian-rasterization"
+
 cd "$REPO_DIR/submodules/diff-gaussian-rasterization"
-"$PYTHON" setup.py install
+git submodule update --init --recursive
+
+if [ ! -f "third_party/glm/glm/glm.hpp" ]; then
+    echo "[ERROR] GLM not found: third_party/glm/glm/glm.hpp"
+    echo "        diff-gaussian-rasterization submodule was not initialized correctly."
+    exit 1
+fi
+
+rm -rf build *.egg-info
+"$PIP" install --no-build-isolation -e .
+
 
 echo "    simple-knn ..."
-if [ ! -d "$REPO_DIR/submodules/simple-knn" ]; then
-    git clone \
-        https://gitlab.inria.fr/bkerbl/simple-knn.git \
-        "$REPO_DIR/submodules/simple-knn"
-fi
+git clone \
+    https://gitlab.inria.fr/bkerbl/simple-knn.git \
+    "$REPO_DIR/submodules/simple-knn"
+
 cd "$REPO_DIR/submodules/simple-knn"
-"$PYTHON" setup.py install
+rm -rf build *.egg-info
+"$PIP" install --no-build-isolation -e .
+
 
 echo "    fused-ssim ..."
-if [ ! -d "$REPO_DIR/submodules/fused-ssim" ]; then
-    git clone \
-        https://github.com/rahul-goel/fused-ssim.git \
-        "$REPO_DIR/submodules/fused-ssim"
-fi
+git clone \
+    https://github.com/rahul-goel/fused-ssim.git \
+    "$REPO_DIR/submodules/fused-ssim"
+
 cd "$REPO_DIR/submodules/fused-ssim"
-"$PYTHON" setup.py install
+rm -rf build *.egg-info
+"$PIP" install --no-build-isolation -e .
 
 cd "$REPO_DIR"
 
