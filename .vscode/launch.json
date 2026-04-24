@@ -1,0 +1,64 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Step 5",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main_6d.py",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "args": [
+                "--stage", "step5",
+                "--out_dir", "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter",
+                "--query_masked_path", "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/query_masked_full.png",
+                "--gallery_dir", "data/can_data/gallery_renders_gs_ds",
+                "--sim_method", "dino_loftr",
+                "--dino_model", "dinov2_vits14",
+                "--dino_input_size", "224",
+                "--topk", "3",
+                "--crop_margin", "12",
+                "--nonblack_thresh", "8",
+                "--device", "cuda",
+                "--dino_scores_json", "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/retrieval_scores.json",
+                "--loftr_pretrained", "outdoor",
+                "--loftr_conf_thresh", "0.5",
+                "--loftr_ransac_thresh", "200.0"
+            ]
+        },
+        {
+            "name": "Python Debugger: Step 6",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main_6d.py",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "args": [
+                "--stage", "step6",
+                "--out_dir", "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter",
+                "--gs_mode", "3dgs",
+                "--gallery_pose_json", "data/can_data/gallery_poses.json",
+                "--gallery_xyz_dir", "data/can_data/gallery_xyz_gs_ds",
+                "--intrinsics_path", "data/can_data/intrinsics_ds.txt",
+                "--query_img", "data/query_0408/q2_00044_ds.jpg",
+                "--query_masked_path", "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/query_masked_full.png",
+                "--query_mask_path", "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/query_mask.png",
+                "--pnp_reproj_error", "10.0",
+                "--axis_len_m", "0.04",
+                "--object_height_m", "0.125",
+                "--canonical_ply_path", "data/can_data/3dgs_pepsi_pinset/pepsi_painted_canonical/point_cloud/iteration_30000/point_cloud.ply",
+                "--gs_model_dir", "data/can_data/3dgs_pepsi_pinset/pepsi_painted",
+                "--gs_iter", "30000",
+                "--gs_repo", "$HOME/6dpose_pipeline",
+                "--render_width", "1920",
+                "--render_height", "1080",
+                "--bg_color", "0,0,0",
+                "--t_refine_iou_thresh", "0.30",
+                "--skip_t_refine"
+            ]
+        }
+    ]
+}
