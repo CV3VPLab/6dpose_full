@@ -34,7 +34,9 @@ echo "============================================================"
 # ── 1. conda env ──────────────────────────────────────────────────────────────
 echo ""
 echo ">>> [1/7] Creating conda env '$ENV_NAME' ..."
+source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda create -n "$ENV_NAME" python=3.10 -y
+conda activate "$ENV_NAME"
 
 # ── 2. PyTorch ────────────────────────────────────────────────────────────────
 echo ""
@@ -107,7 +109,7 @@ mkdir -p "$REPO_DIR/submodules"
 
 echo "    diff-gaussian-rasterization ..."
 if [ ! -d "$REPO_DIR/submodules/diff-gaussian-rasterization" ]; then
-    git clone --branch dr_aa \
+    git clone --recursive--branch dr_aa \
         https://github.com/graphdeco-inria/diff-gaussian-rasterization.git \
         "$REPO_DIR/submodules/diff-gaussian-rasterization"
 fi
