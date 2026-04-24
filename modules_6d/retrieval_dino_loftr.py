@@ -57,14 +57,6 @@ def load_or_compute_gallery_features(
     nonblack_thresh: int,
     crop_margin: int,
 ) -> dict:
-    """
-    gallery 이미지들의 DINOv2 feature를 캐시에서 로드하거나 계산해서 저장.
-    DINO 입력용으로는 nonblack crop 사용 (similarity 품질을 위해).
-    LoFTR에는 full 이미지를 사용하므로 crop 좌표는 저장하지 않음.
-
-    cache_dir: data/can_data/dino_cache/
-    반환: {filename: {"feat": np.ndarray(384,), "path": str}}
-    """
     ensure_dir(cache_dir)
     cache_index_path = cache_dir / f"gallery_feat_index_{model_name.replace('/', '_')}.json"
 
@@ -189,15 +181,7 @@ def save_best_match_data(
     gallery_crop_hw, gallery_nonblack_bbox_xyxy, gallery_img_hw,
     loftr_resize_target=640,
 ):
-    """
-    query 쪽: full image 기준 (crop 없음)
-      - query_hw: full image (H, W) e.g. (2160, 3840)
-      - query_nonblack_bbox_xyxy: [0, 0, W, H] (전체 이미지)
 
-    gallery 쪽: crop 기준 유지
-      - gallery_crop_hw: tight crop 크기
-      - gallery_nonblack_bbox_xyxy: full gallery render 이미지 기준 bbox
-    """
     ensure_dir(out_dir)
     out_dir = Path(out_dir)
 
@@ -261,9 +245,7 @@ def draw_loftr_matches_full(img0_full, img1_full,
                             q_crop_hw, g_crop_hw,
                             inlier_mask, out_path,
                             loftr_size=840, max_draw=400):
-    """
-    crop 좌표계 mkpts를 full image 좌표로 역변환한 뒤 full image에 시각화.
-    """
+
     m0_crop = unmap_from_square_resize(mkpts0_crop, q_crop_hw, loftr_size)
     m1_crop = unmap_from_square_resize(mkpts1_crop, g_crop_hw, loftr_size)
 
