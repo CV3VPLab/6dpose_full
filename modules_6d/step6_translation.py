@@ -58,14 +58,13 @@ def unmap_from_square_resize(pts_resized, orig_hw, resize_target=840):
     x0 = (side - w) // 2
     y0 = (side - h) // 2
 
-    pts_square = np.asarray(pts_resized, dtype=np.float64) * (side / resize_target)
+    pts_square = pts_resized * (side / resize_target)
     pts_crop = pts_square - np.array([[x0, y0]], dtype=np.float64)
     return pts_crop
 
 
 def to_full_image_coords(pts_crop, nonblack_bbox_xyxy):
-    x1, y1 = float(nonblack_bbox_xyxy[0]), float(nonblack_bbox_xyxy[1])
-    pts = np.asarray(pts_crop, dtype=np.float64) + np.array([[x1, y1]])
+    pts = pts_crop + np.array([nonblack_bbox_xyxy[:2]])
     return pts
 
 
@@ -1455,12 +1454,13 @@ def run_step6_translation(args):
         )
 
     match_data = np.load(str(npz_path))
+    meta = load_json(meta_path)
+    loftr_json = load_json(loftr_json_path)
+
     mkpts0_840 = match_data["mkpts0_inlier_840"].astype(np.float64)
     mkpts1_840 = match_data["mkpts1_inlier_840"].astype(np.float64)
     conf_inlier = match_data["conf_inlier"].astype(np.float64)
 
-    meta = load_json(meta_path)
-    loftr_json = load_json(loftr_json_path)
     best_render = loftr_json["best_render"]
 
     print(f"  Loaded {len(mkpts0_840)} inlier matches for '{best_render}'")
@@ -1474,25 +1474,25 @@ def run_step6_translation(args):
 
     resize_target = int(meta["loftr_resize_target"])
 
-    q_crop_hw = tuple(meta["query_crop_hw"])
+    q_crop_hw = meta["query_crop_hw"]
     q_bbox    = meta["query_nonblack_bbox_xyxy"]
     pts_q_crop = unmap_from_square_resize(mkpts0_840, q_crop_hw, resize_target)
     pts_q_full = to_full_image_coords(pts_q_crop, q_bbox)
 
-    if len(pts_q_full) > 0:
-        print(f"  pts_q_full range: x=[{pts_q_full[:,0].min():.0f},{pts_q_full[:,0].max():.0f}], y=[{pts_q_full[:,1].min():.0f},{pts_q_full[:,1].max():.0f}]")
-
-    g_crop_hw = tuple(meta["gallery_crop_hw"])
+    g_crop_hw = meta["gallery_crop_hw"]
     g_bbox = meta["gallery_nonblack_bbox_xyxy"]
     pts_g_crop = unmap_from_square_resize(mkpts1_840, g_crop_hw, resize_target)
     pts_g_full = to_full_image_coords(pts_g_crop, g_bbox)
-    if len(pts_g_full) > 0:
-        print(f"  pts_g_full range: x=[{pts_g_full[:,0].min():.0f},{pts_g_full[:,0].max():.0f}], y=[{pts_g_full[:,1].min():.0f},{pts_g_full[:,1].max():.0f}]")
-
+    
+    # KSCHOI : float16 -> float64
     xyz_dir = Path(args.gallery_xyz_dir)
     xyz_map_path = find_xyz_map_path(xyz_dir, best_render)
     xyz_map = np.load(str(xyz_map_path)).astype(np.float64)
 
+    if len(pts_q_full) > 0:
+        print(f"  pts_q_full range: x=[{pts_q_full[:,0].min():.0f},{pts_q_full[:,0].max():.0f}], y=[{pts_q_full[:,1].min():.0f},{pts_q_full[:,1].max():.0f}]")
+    if len(pts_g_full) > 0:
+        print(f"  pts_g_full range: x=[{pts_g_full[:,0].min():.0f},{pts_g_full[:,0].max():.0f}], y=[{pts_g_full[:,1].min():.0f},{pts_g_full[:,1].max():.0f}]")
     print(f"  XYZ map: {xyz_map_path.name}  shape={xyz_map.shape}")
 
     canonical_ply_path = getattr(args, "canonical_ply_path", None)
@@ -1538,6 +1538,7 @@ def run_step6_translation(args):
     pts2d_corr = pts_q_full[valid_mask]
     pts3d_corr = pts3d[valid_mask]
     pts_g_corr = pts_g_full[valid_mask]
+    conf_corr = conf_inlier[valid_mask]
 
     print(f"  Before query-mask filtering: {len(pts2d_corr)} correspondences")
 
@@ -1557,6 +1558,7 @@ def run_step6_translation(args):
         pts2d_corr = pts2d_corr[inside_mask]
         pts3d_corr = pts3d_corr[inside_mask]
         pts_g_corr = pts_g_corr[inside_mask]
+        conf_corr = conf_corr[inside_mask]
 
         if len(pts2d_corr) < 4:
             raise RuntimeError(
@@ -1566,12 +1568,7 @@ def run_step6_translation(args):
         print("  [WARN] --query_mask_path not provided, skipping query-mask filtering")
 
     pts2d_before_uniform = pts2d_corr.copy()
-    pts3d_before_uniform = pts3d_corr.copy()
-
-    conf_corr = conf_inlier[valid_mask]
-    if query_mask_path:
-        conf_corr = conf_corr[inside_mask]
-
+        
     use_uniform_sampling = True
     uniform_keep_idx = None
     uniform_cell_stats = None
@@ -1641,9 +1638,7 @@ def run_step6_translation(args):
     print(f"  pts2d_corr are already in full-image coordinates: shape={pts2d_corr.shape}")
 
     query_img = load_image(args.query_img)
-    axis_len = float(getattr(args, "axis_len_m", 0.04))
-    canonical_ply_path = getattr(args, "canonical_ply_path", None)
-
+    
     render_width = int(getattr(args, "render_width", query_img.shape[1]))
     render_height = int(getattr(args, "render_height", query_img.shape[0]))
     gs_model_dir = getattr(args, "gs_model_dir", None)
@@ -1661,22 +1656,13 @@ def run_step6_translation(args):
         else:
             print(f"  [WARN] query_masked_path not found: {qmp}")
 
-    if canonical_ply_path is not None:
-        canonical_ply_path = Path(canonical_ply_path)
-        if canonical_ply_path.exists():
-            ply_xyz = load_ply_xyz(canonical_ply_path)
-        else:
-            print(f"  [Pre-PnP PLY overlay] canonical_ply_path not found: {canonical_ply_path}")
-
     no_pnp = bool(getattr(args, "no_pnp", False))
 
     if no_pnp:
         R_out = R_gallery.copy()
         inlier_idx = np.arange(len(pts2d_corr), dtype=np.int32)
-        inlier_count = len(pts2d_corr)
         reproj_err = np.inf
-        pose_method = "no_pnp_gallery_R"
-
+        
         object_height_m_init = float(getattr(args, "object_height_m", 0.125))
         _qmask_init = make_query_reference_mask(
             query_masked_img=query_masked_img,
