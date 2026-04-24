@@ -16,7 +16,7 @@ export TORCH_CUDA_ARCH_LIST="8.6"
 #   step6   : translation refinement + PnP
 #   step7   : pose refinement (GS, 1920x1080)
 # =========================================================
-STAGE="step6"
+STAGE="step1"
 
 # ---------------------
 # Downsampling factor
