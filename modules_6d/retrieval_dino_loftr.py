@@ -52,7 +52,6 @@ def load_or_compute_gallery_features(
     ensure_dir(cache_dir)
     cache_index_path = cache_dir / f"gallery_feat_index_{model_name.replace('/', '_')}.json"
 
-    # 기존 캐시 인덱스 로드
     if cache_index_path.exists():
         with open(cache_index_path, "r") as f:
             cache_index = json.load(f)
@@ -67,14 +66,12 @@ def load_or_compute_gallery_features(
         file_hash = _file_hash(gp)
         cache_feat_path = cache_dir / f"{gp.stem}_{model_name.replace('/', '_')}.npy"
 
-        # 캐시 hit: 파일 해시가 같고 feature 파일이 존재
         if (key in cache_index
                 and cache_index[key].get("hash") == file_hash
                 and cache_feat_path.exists()):
             feat = np.load(str(cache_feat_path))
             print(f"  [Cache HIT ] {key}")
         else:
-            # 캐시 miss: full 이미지 → nonblack crop → DINO (crop은 DINO 입력용으로만)
             gimg = load_rgb(gp)
             gh, gw = gimg.shape[:2]
             gbox = compute_nonblack_bbox(gimg, thresh=nonblack_thresh)
@@ -189,10 +186,8 @@ def save_best_match_data(
 
     meta = {
         "loftr_resize_target": loftr_resize_target,
-        # Query: full image 기준 (crop 없음)
         "query_crop_hw": list(query_hw),                        # full image HW
         "query_nonblack_bbox_xyxy": list(query_nonblack_bbox_xyxy),  # [0,0,W,H]
-        # Gallery: crop 기준
         "gallery_crop_hw": list(gallery_crop_hw),
         "gallery_nonblack_bbox_xyxy": [int(v) for v in gallery_nonblack_bbox_xyxy],
         "gallery_img_hw": list(gallery_img_hw),
@@ -219,7 +214,6 @@ def get_mask_inlier_indices(mkpts0_full, mask_path):
     keep_mask = []
     for pt in mkpts0_full:
         x, y = int(round(pt[0])), int(round(pt[1]))
-        # 마스크 범위 내에 있고, 물체 영역(>0)인 경우만 True
         if 0 <= x < w and 0 <= y < h and mask[y, x] > 0:
             keep_mask.append(True)
         else:
@@ -248,7 +242,6 @@ def draw_loftr_matches_full(img0_full, img1_full,
     h0, w0 = img0_full.shape[:2]
     h1, w1 = img1_full.shape[:2]
 
-    # 두 이미지를 같은 높이로 리사이즈해서 나란히
     scale = min(h0, h1) / max(h0, h1)
     if h0 > h1:
         img0_vis = cv2.resize(img0_full, (int(w0 * h1 / h0), h1))
@@ -337,19 +330,13 @@ def run_step5_dino_loftr_rerank(args):
 
     # ── 3. DINOv2 feature (캐시 활용) ────────────────────────────────────────
     extractor = DinoV2Extractor(args.dino_model, device=device)
-
-    # query feature (full image → nonblack crop → square_pad → DINO)
-    # query 자체도 crop해서 DINO에 넣어야 similarity가 의미있음
-    # (full 3840x2160 이미지를 224px로 줄이면 캔이 너무 작아짐)
     qbox = compute_nonblack_bbox(query_full, thresh=args.nonblack_thresh)
     qbox = expand_bbox(qbox, args.crop_margin, qw, qh)
     query_crop_for_dino = crop_with_bbox(query_full, qbox)
     query_dino_in = square_pad_resize(query_crop_for_dino, args.dino_input_size)
     qfeat = extractor.encode_bgr(query_dino_in)
 
-    # gallery feature 캐시 경로: data/can_data/dino_cache/
     cache_dir = Path(args.out_dir).parent.parent / "can_data" / "dino_cache_3dgs_1920"
-    # fallback: out_dir 기준
     if not (Path(args.out_dir).parent.parent / "can_data").exists():
         cache_dir = Path(args.out_dir) / "dino_cache_3dgs"
     print(f"  DINOv2 cache dir: {cache_dir}")
@@ -379,7 +366,6 @@ def run_step5_dino_loftr_rerank(args):
     topk_items = scores_sorted[:args.topk]
     print(f"  DINOv2 top-{args.topk}: {[x['file'] for x in topk_items]}")
 
-    # dino scores json 저장 (step4 단독 실행 결과와 호환)
     dino_scores_path = out_dir / "retrieval_scores.json"
     save_json(dino_scores_path, {
         "stage": "step5",
@@ -490,10 +476,8 @@ def run_step5_dino_loftr_rerank(args):
         mkpts1_all=best_cache["mkpts1_all"],
         conf_all=best_cache["conf_all"],
         inlier_mask=best_cache["inlier_mask"],
-        # Query: step1 crop 기준 (full image bbox 저장 → step6에서 offset 복원)
         query_hw=best_cache["q_loftr_hw"],
         query_nonblack_bbox_xyxy=best_cache["q_loftr_bbox"],
-        # Gallery: nonblack crop 기준 (full image bbox 저장)
         gallery_crop_hw=best_cache["g_loftr_hw"],
         gallery_nonblack_bbox_xyxy=best_cache["g_loftr_bbox"],
         gallery_img_hw=best_cache["gimg_hw"],
