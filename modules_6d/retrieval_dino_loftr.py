@@ -1,15 +1,7 @@
 """
 retrieval_dino_loftr.py
 =======================
-step5: DINOv2 retrieval + LoFTR rerank 통합 버전
-
-변경사항:
-  - sim_method=dino_loftr 하나로 dino 계산 → loftr rerank 한번에 처리
-  - gallery DINOv2 feature를 data/can_data/dino_cache/ 에 캐싱 (재실행 시 재사용)
-  - query 쪽 tight_crop_nonblack 제거 → query_masked_full.png (full 해상도) 그대로 사용
-    (좌표계 일관성: 모든 query 좌표가 full image 기준)
-  - gallery 쪽은 기존과 동일하게 tight_crop_nonblack 유지
-    (gallery render는 배경이 검정이라 crop이 유효)
+step5: DINOv2 LoFTR 
 """
 
 import hashlib
