@@ -16,7 +16,7 @@ export TORCH_CUDA_ARCH_LIST="8.6"
 #   step6   : translation refinement + PnP
 #   step7   : pose refinement (GS, 1920x1080)
 # =========================================================
-STAGE="step6"
+STAGE="step5"
 
 # ---------------------
 # Downsampling factor
@@ -109,10 +109,10 @@ PREVIEW_SIZE="900"
 # ---------------------
 # Step 4 settings – GS gallery render (downsampled)
 # ---------------------
-GALLERY_SHARE_DIR="data/outputs/gallery_shared_pepsi_ds_580k_${GS_MODE}"
+GALLERY_SHARE_DIR="data/can_data"
 GALLERY_POSE_JSON="${GALLERY_SHARE_DIR}/gallery_poses.json"
 CANONICAL_PLY_PATH="${CANONICAL_MODEL_DIR}/point_cloud/iteration_${GS_ITER}/point_cloud.ply"
-GS_REPO="$HOME/6dpose_full"
+GS_REPO="$HOME/6dpose_pipeline"
 
 GS_GALLERY_OUTPUT_DIR="${GALLERY_SHARE_DIR}/gallery_renders_gs_ds"
 GS_RENDER_WIDTH="${DS_RENDER_WIDTH}"
