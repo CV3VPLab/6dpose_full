@@ -1,20 +1,3 @@
-#!/bin/bash
-# =============================================================================
-# setup_full.sh  —  6dpose_gs conda environment
-#
-# 현재 실제 동작 환경 기준 (2026-04-24)
-#
-# 포함:
-#   - PyTorch 2.5.1+cu118  (Python 3.10)
-#   - YOLO, SAM2 (git clone), DINOv2, LoFTR (kornia), timm
-#   - gsplat 1.5.3
-#   - diff-gaussian-rasterization, simple-knn, fused-ssim (local submodules)
-#   - scipy, h5py, plyfile, lpips 등
-#
-# Usage:
-#   bash setup_full.sh
-# =============================================================================
-
 set -e
 
 ENV_NAME="6dpose_test"
