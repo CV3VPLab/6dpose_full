@@ -1,3 +1,4 @@
 data/
 *.pyc
 *.pt
+utils/__pycache__/*.pyc
