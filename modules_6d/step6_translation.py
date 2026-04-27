@@ -1495,35 +1495,6 @@ def run_step6_translation(args):
         print(f"  pts_g_full range: x=[{pts_g_full[:,0].min():.0f},{pts_g_full[:,0].max():.0f}], y=[{pts_g_full[:,1].min():.0f},{pts_g_full[:,1].max():.0f}]")
     print(f"  XYZ map: {xyz_map_path.name}  shape={xyz_map.shape}")
 
-    canonical_ply_path = getattr(args, "canonical_ply_path", None)
-    if canonical_ply_path is not None and Path(canonical_ply_path).exists():
-        _ply_xyz = load_ply_xyz(Path(canonical_ply_path))
-        _ply_norms = np.linalg.norm(_ply_xyz, axis=1)
-        _ply_med_norm = float(np.median(_ply_norms))
-
-        _xyz_valid_mask = np.abs(xyz_map).sum(axis=-1) > 1e-6
-        if _xyz_valid_mask.any():
-            _xyz_valid = xyz_map[_xyz_valid_mask]
-            _xyz_norms = np.linalg.norm(_xyz_valid, axis=1)
-            _p5, _p95 = np.percentile(_xyz_norms, [5, 95])
-            _core_mask = (_xyz_norms >= _p5) & (_xyz_norms <= _p95)
-            if _core_mask.sum() > 100:
-                _xyz_med_norm = float(np.median(_xyz_norms[_core_mask]))
-                _scale_correction = _ply_med_norm / _xyz_med_norm
-                if 0.8 < _scale_correction < 1.25:
-                    xyz_map = xyz_map * _scale_correction
-                    print(f"  [XYZ scale fix] PLY median norm={_ply_med_norm:.6f}, "
-                          f"XYZ median norm={_xyz_med_norm:.6f}, "
-                          f"correction={_scale_correction:.6f}")
-                else:
-                    print(f"  [XYZ scale fix] correction={_scale_correction:.4f} out of range, skipped")
-            else:
-                print(f"  [XYZ scale fix] insufficient core points, skipped")
-        else:
-            print(f"  [XYZ scale fix] no valid XYZ map points")
-    else:
-        print(f"  [XYZ scale fix] canonical_ply_path not provided, skipped")
-
     pts3d, valid_mask = lookup_xyz_at_pixels(xyz_map, pts_g_full, bilinear=True)
 
     n_valid = int(valid_mask.sum())
