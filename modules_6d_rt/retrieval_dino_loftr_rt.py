@@ -1,16 +1,3 @@
-"""
-retrieval_dino_loftr_rt.py
-==========================
-Real-time version of step5: DINOv2 retrieval + LoFTR rerank.
-Saves only the data files needed by step6:
-  - retrieval_scores.json
-  - loftr_scores.json
-  - step4_rerank_summary.json
-  - loftr_best_match_data.npz
-  - loftr_best_match_meta.json
-No debug visualization images (no loftr_vis_*.png, no query_vs_best_reranked.png).
-"""
-
 import hashlib
 import json
 from pathlib import Path
@@ -182,12 +169,15 @@ def get_mask_inlier_indices(mkpts0_full, mask_path):
         return np.ones(len(mkpts0_full), dtype=bool)
 
     h, w = mask.shape
-    xs = np.round(mkpts0_full[:, 0]).astype(int)
-    ys = np.round(mkpts0_full[:, 1]).astype(int)
-    in_bounds = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-    keep_mask = np.zeros(len(mkpts0_full), dtype=bool)
-    keep_mask[in_bounds] = mask[ys[in_bounds], xs[in_bounds]] > 0
-    return keep_mask
+    keep_mask = []
+    for pt in mkpts0_full:
+        x, y = int(round(pt[0])), int(round(pt[1]))
+        if 0 <= x < w and 0 <= y < h and mask[y, x] > 0:
+            keep_mask.append(True)
+        else:
+            keep_mask.append(False)
+            
+    return np.array(keep_mask)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,12 +185,7 @@ def get_mask_inlier_indices(mkpts0_full, mask_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_step4_dino_loftr_rerank_rt(args, model_cache=None):
-    """
-    DINOv2 retrieval + LoFTR rerank (real-time version).
-    Pass model_cache to skip model loading and reuse pre-loaded models and
-    pre-computed gallery DINOv2 features.
-    No debug visualization images saved.
-    """
+
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -216,7 +201,24 @@ def run_step4_dino_loftr_rerank_rt(args, model_cache=None):
     print(f"  Query full image: {qw}x{qh}")
 
     LOFTR_SIZE = 840
-    query_l = square_pad_resize(query_full, LOFTR_SIZE)
+    step1_json_path = Path(args.out_dir) / "step1_result.json"
+    q_loftr_bbox = None
+    if step1_json_path.exists():
+        with open(step1_json_path) as f:
+            step1_data = json.load(f)
+        raw_bbox = step1_data.get("mask_bbox_xyxy") or step1_data.get("bbox_xyxy")
+        if raw_bbox is not None:
+            q_loftr_bbox = list(expand_bbox(raw_bbox, args.crop_margin, qw, qh))
+            print(f"  [LoFTR] Query crop from step1 bbox: {q_loftr_bbox}")
+
+    if q_loftr_bbox is None:
+        q_loftr_bbox = [0, 0, qw, qh]
+        print(f"  [LoFTR] step1 bbox not found, using full image")
+
+    query_loftr_crop = crop_with_bbox(query_full, q_loftr_bbox)
+    q_loftr_h, q_loftr_w = query_loftr_crop.shape[:2]
+    query_l = square_pad_resize(query_loftr_crop, LOFTR_SIZE)
+    print(f"  [LoFTR] Query crop size: {q_loftr_w}x{q_loftr_h} → {LOFTR_SIZE}px")
 
     # ── 2. Gallery file list ──────────────────────────────────────────────────
     gallery_dir = Path(args.gallery_dir)
@@ -296,20 +298,27 @@ def run_step4_dino_loftr_rerank_rt(args, model_cache=None):
     results = []
     match_cache = {}
 
+    query_mask_path = Path(args.out_dir) / "query_mask.png"
+
     for item in topk_items:
         gpath = Path(item["path"])
         gimg = load_rgb(str(gpath))
         gh, gw = gimg.shape[:2]
 
-        gallery_l = square_pad_resize(gimg, LOFTR_SIZE)
+        # gallery: nonblack bbox crop → LoFTR 입력
+        g_loftr_bbox = list(compute_nonblack_bbox(gimg, thresh=args.nonblack_thresh))
+        g_loftr_bbox = list(expand_bbox(g_loftr_bbox, args.crop_margin, gw, gh))
+        gallery_loftr_crop = crop_with_bbox(gimg, g_loftr_bbox)
+        g_loftr_h, g_loftr_w = gallery_loftr_crop.shape[:2]
+        gallery_l = square_pad_resize(gallery_loftr_crop, LOFTR_SIZE)
         mkpts0, mkpts1, conf = compute_loftr_matches(matcher, query_l, gallery_l, device=device)
 
         valid = conf >= args.loftr_conf_thresh
         mkpts0_v, mkpts1_v, conf_v = mkpts0[valid], mkpts1[valid], conf[valid]
 
         # Filter by query mask
-        m0_full_temp = unmap_from_square_resize(mkpts0_v, (qh, qw), resize_target=LOFTR_SIZE)
-        query_mask_path = Path(args.out_dir) / "query_mask.png"
+        m0_crop_temp = unmap_from_square_resize(mkpts0_v, (q_loftr_h, q_loftr_w), resize_target=LOFTR_SIZE)
+        m0_full_temp = m0_crop_temp + np.array([[q_loftr_bbox[0], q_loftr_bbox[1]]])
         mask_keep = get_mask_inlier_indices(m0_full_temp, query_mask_path)
         mkpts0_v = mkpts0_v[mask_keep]
         mkpts1_v = mkpts1_v[mask_keep]
@@ -333,13 +342,18 @@ def run_step4_dino_loftr_rerank_rt(args, model_cache=None):
         })
 
         match_cache[item["file"]] = {
-            "mkpts0_all": mkpts0_v,
-            "mkpts1_all": mkpts1_v,
-            "conf_all": conf_v,
+            "mkpts0_all":  mkpts0_v,
+            "mkpts1_all":  mkpts1_v,
+            "conf_all":    conf_v,
             "inlier_mask": inlier_mask,
-            "gcrop_bbox": [0, 0, gw, gh],
-            "gcrop_hw": (gh, gw),
-            "gimg_hw": (gh, gw),
+            "q_loftr_bbox":  q_loftr_bbox,
+            "q_loftr_hw":    (q_loftr_h, q_loftr_w),
+            "g_loftr_bbox":  g_loftr_bbox,
+            "g_loftr_hw":    (g_loftr_h, g_loftr_w),
+            "gimg_hw":       (gh, gw),
+            "query_l":       query_l,
+            "gallery_l":     gallery_l,
+            "gimg":          gimg,
         }
 
     # ── 6. LoFTR score sort → best ────────────────────────────────────────────
@@ -359,10 +373,10 @@ def run_step4_dino_loftr_rerank_rt(args, model_cache=None):
         mkpts1_all=best_cache["mkpts1_all"],
         conf_all=best_cache["conf_all"],
         inlier_mask=best_cache["inlier_mask"],
-        query_hw=(qh, qw),
-        query_nonblack_bbox_xyxy=[0, 0, qw, qh],
-        gallery_crop_hw=best_cache["gcrop_hw"],
-        gallery_nonblack_bbox_xyxy=best_cache["gcrop_bbox"],
+        query_hw=best_cache["q_loftr_hw"],
+        query_nonblack_bbox_xyxy=best_cache["q_loftr_bbox"],
+        gallery_crop_hw=best_cache["g_loftr_hw"],
+        gallery_nonblack_bbox_xyxy=best_cache["g_loftr_bbox"],
         gallery_img_hw=best_cache["gimg_hw"],
         loftr_resize_target=LOFTR_SIZE,
     )
