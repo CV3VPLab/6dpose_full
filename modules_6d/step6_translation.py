@@ -59,19 +59,19 @@ def unmap_from_square_resize(pts_resized, orig_hw, resize_target=840):
     y0 = (side - h) // 2
 
     pts_square = pts_resized * (side / resize_target)
-    pts_crop = pts_square - np.array([[x0, y0]], dtype=np.float64)
+    pts_crop = pts_square - np.array([[x0, y0]], dtype=np.float32)
     return pts_crop
 
 
-def to_full_image_coords(pts_crop, nonblack_bbox_xyxy):
-    pts = pts_crop + np.array([nonblack_bbox_xyxy[:2]])
+def to_full_image_coords(pts_crop, offset_xy):
+    pts = pts_crop + offset_xy[None, :]
     return pts
 
 
 def find_xyz_map_path(xyz_dir: Path, render_filename: str):
     stem = Path(render_filename).stem
     candidates = [
-        xyz_dir / f"{stem}.npy",
+        xyz_dir / f"{stem}c.npy",
         xyz_dir / f"{stem}_xyz.npy",
         xyz_dir / f"{stem}_xyz_map.npy",
     ]
@@ -1443,6 +1443,7 @@ def run_step6_translation(args):
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
 
+    gallery_dir = Path(args.gallery_xyz_dir).parent / "gallery_renders_gs_ds"
     npz_path = out_dir / "loftr_best_match_data.npz"
     meta_path = out_dir / "loftr_best_match_meta.json"
     loftr_json_path = out_dir / "loftr_scores.json"
@@ -1457,9 +1458,11 @@ def run_step6_translation(args):
     meta = load_json(meta_path)
     loftr_json = load_json(loftr_json_path)
 
-    mkpts0_840 = match_data["mkpts0_inlier_840"].astype(np.float64)
-    mkpts1_840 = match_data["mkpts1_inlier_840"].astype(np.float64)
-    conf_inlier = match_data["conf_inlier"].astype(np.float64)
+    g_bboxes = np.load(gallery_dir / "gallery_bboxes.npy")
+
+    mkpts0_840 = match_data["mkpts0"]
+    mkpts1_840 = match_data["mkpts1"]
+    conf = match_data["conf"]
 
     best_render = loftr_json["best_render"]
 
@@ -1474,26 +1477,33 @@ def run_step6_translation(args):
 
     resize_target = int(meta["loftr_resize_target"])
 
-    q_crop_hw = meta["query_crop_hw"]
-    q_bbox    = meta["query_nonblack_bbox_xyxy"]
+    q_bbox    = np.array(meta["query_nonblack_bbox_xyxy"], dtype=np.int32)
+    q_crop_hw = np.flip(q_bbox[2:] - q_bbox[:2])
     pts_q_crop = unmap_from_square_resize(mkpts0_840, q_crop_hw, resize_target)
-    pts_q_full = to_full_image_coords(pts_q_crop, q_bbox)
+    pts_q_full = to_full_image_coords(pts_q_crop, q_bbox[:2])
 
-    g_crop_hw = meta["gallery_crop_hw"]
-    g_bbox = meta["gallery_nonblack_bbox_xyxy"]
+    g_bbox = g_bboxes[int(best_render)]
+    g_crop_hw = np.flip(g_bbox[2:] - g_bbox[:2])
     pts_g_crop = unmap_from_square_resize(mkpts1_840, g_crop_hw, resize_target)
-    pts_g_full = to_full_image_coords(pts_g_crop, g_bbox)
+    pts_g_full = to_full_image_coords(pts_g_crop, g_bbox[:2])
     
-    # KSCHOI : float16 -> float64
     xyz_dir = Path(args.gallery_xyz_dir)
-    xyz_map_path = find_xyz_map_path(xyz_dir, best_render)
-    xyz_map = np.load(str(xyz_map_path)).astype(np.float64)
+    xyz_mapc_path = xyz_dir / f"{best_render}c.npy"
+    xyz_mapc = np.load(str(xyz_mapc_path)) 
+    xyz_map = np.zeros( (1080, 1920, 3), dtype=np.float32)
+    xyz_map[ g_bbox[1]:g_bbox[3], g_bbox[0]:g_bbox[2], : ] = xyz_mapc
+
+    # KSCHOI: XYZ map 검증을 위해 원본 XYZ map도 로드해서 비교해봄. xyz_map1(1920*1080), xyz_mapc(박스 영역), xyz_map(전체 이미지에 박스 영역만 채워넣은 것)
+    # xyz_map_path = xyz_dir / f"{best_render}.npy"
+    # xyz_map1 = np.load(str(xyz_map_path))
+    # assert np.array_equal(xyz_map, xyz_map1), f"XYZ map mismatch between {xyz_map_path} and {xyz_mapc_path}"
 
     if len(pts_q_full) > 0:
         print(f"  pts_q_full range: x=[{pts_q_full[:,0].min():.0f},{pts_q_full[:,0].max():.0f}], y=[{pts_q_full[:,1].min():.0f},{pts_q_full[:,1].max():.0f}]")
     if len(pts_g_full) > 0:
         print(f"  pts_g_full range: x=[{pts_g_full[:,0].min():.0f},{pts_g_full[:,0].max():.0f}], y=[{pts_g_full[:,1].min():.0f},{pts_g_full[:,1].max():.0f}]")
-    print(f"  XYZ map: {xyz_map_path.name}  shape={xyz_map.shape}")
+    print(f"  XYZ map: {xyz_mapc_path.name}  shape={xyz_map.shape}")
+
 
     pts3d, valid_mask = lookup_xyz_at_pixels(xyz_map, pts_g_full, bilinear=True)
 
@@ -1509,7 +1519,7 @@ def run_step6_translation(args):
     pts2d_corr = pts_q_full[valid_mask]
     pts3d_corr = pts3d[valid_mask]
     pts_g_corr = pts_g_full[valid_mask]
-    conf_corr = conf_inlier[valid_mask]
+    conf_corr = conf[valid_mask]
 
     print(f"  Before query-mask filtering: {len(pts2d_corr)} correspondences")
 
@@ -1983,7 +1993,7 @@ def run_step6_translation(args):
         "n_valid_2d3d_corr": n_valid,
         "pnp_reproj_error_px": reproj_err if np.isfinite(reproj_err) else None,
         "gallery_pose_source": args.gallery_pose_json,
-        "xyz_map_used": str(xyz_map_path),
+        "xyz_map_used": str(xyz_mapc_path),
         "R_gallery_init": R_gallery.tolist(),
         "R_obj_to_cam": R_out.tolist(),
         "t_obj_to_cam": t_out.tolist(),

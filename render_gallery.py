@@ -6,13 +6,26 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torchvision
 from tqdm import tqdm
 import cv2
 
 from gaussian_renderer import GaussianModel
 from gsplat import rasterization as _gsplat_rasterize
 
+from modules_6d.retrieval_dino import DinoV2Extractor
+
+from modules_6d.io_utils import (
+    ensure_dir, 
+    save_json
+)
+from utils.image_utils import (
+    extract_bbox_and_crop, 
+    crop_with_bbox,
+    get_max_bbox_size,
+    square_bbox,
+    square_pad_resize,
+    load_rgb
+)
 
 def parse_args():
     p = argparse.ArgumentParser(description="Render gallery images from custom poses for GS model")
@@ -41,6 +54,8 @@ def parse_args():
     p.add_argument("--depth_dir", type=str, default=None)
     p.add_argument("--depth_vis_dir", type=str, default=None)
     p.add_argument("--xyz_dir", type=str, default=None)
+    p.add_argument("--dino_model", type=str, default="dinov2_vits14")
+    p.add_argument("--dino_input_size", type=int, default=224)
     return p.parse_args()
 
 
@@ -202,32 +217,25 @@ def render_with_gsplat(gaussians, R_obj_to_cam, t_obj_to_cam,
     return render_chw, depth_hw
 
 
-def save_depth_npy_and_vis(depth_tensor, npy_path, vis_path):
-    if depth_tensor.ndim == 3:
-        depth_np = depth_tensor.squeeze(0).detach().cpu().numpy()
-    else:
-        depth_np = depth_tensor.detach().cpu().numpy()
-
-    np.save(str(npy_path), depth_np.astype(np.float32))
-
+def get_depth_img(depth_np):
     valid = depth_np > 1e-8
     if np.any(valid):
         dmin = depth_np[valid].min()
         dmax = depth_np[valid].max()
-        vis = np.zeros_like(depth_np, dtype=np.uint8)
-        vis[valid] = ((depth_np[valid] - dmin) / (dmax - dmin + 1e-8) * 255).astype(np.uint8)
+        img = np.zeros_like(depth_np, dtype=np.uint8)
+        img[valid] = ((depth_np[valid] - dmin) / (dmax - dmin + 1e-8) * 255).astype(np.uint8)
     else:
-        vis = np.zeros_like(depth_np, dtype=np.uint8)
+        img = np.zeros_like(depth_np, dtype=np.uint8)
 
-    cv2.imwrite(str(vis_path), vis)
-    return depth_np
+    return img
 
 
 def depth_to_xyz_map(depth_np, fx, fy, cx, cy, R_obj_to_cam, t_obj_to_cam):
     H, W = depth_np.shape
     uu, vv = np.meshgrid(np.arange(W), np.arange(H))
 
-    Z = depth_np.astype(np.float32)
+    assert depth_np.dtype == np.float32, f"Expected depth_np to be float32"
+    Z = depth_np
     valid = Z > 1e-8
 
     Xc = (uu - cx) * Z / fx
@@ -314,20 +322,22 @@ def run_render_gallery(args, gaussians=None):
     if device != "cuda":
         raise RuntimeError("This renderer is expected to run on CUDA.")
 
-    model_dir = Path(args.model_dir)
-    output_dir = Path(args.output_dir)
+    model_dir = Path(args.model_dir)    # 3DGS path
+    output_dir = Path(args.output_dir)  # rendered gallery path
+    render_crop_dir = Path(args.output_dir).parent / "gallery_renders_crop_gs_ds"
     ensure_dir(output_dir)
-
+    ensure_dir(render_crop_dir)
+    
     depth_dir = Path(args.depth_dir) if args.depth_dir else (Path(args.output_dir).parent / "gallery_depth_gs")
     depth_vis_dir = Path(args.depth_vis_dir) if args.depth_vis_dir else (Path(args.output_dir).parent / "gallery_depth_vis_gs")
     xyz_dir = Path(args.xyz_dir) if args.xyz_dir else (Path(args.output_dir).parent / "gallery_xyz_gs")
 
     if args.save_depth:
-        depth_dir.mkdir(parents=True, exist_ok=True)
-        depth_vis_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(depth_dir)
+        ensure_dir(depth_vis_dir)        
 
     if args.save_xyz:
-        xyz_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(xyz_dir)
 
     gallery = load_gallery_poses(args.gallery_pose_json)
     fx, fy, cx, cy = load_intrinsics(args.intrinsics_path)
@@ -369,10 +379,19 @@ def run_render_gallery(args, gaussians=None):
         "renders": []
     }
 
+    gallery_bboxes = []
+
+    # Sanity check: ensure pose indices are 0...N-1 without gaps
+    ii = 0
+    for pose in gallery["poses"]:
+        idx = pose["index"]
+        assert idx == ii, f"Expected pose index {ii}, got {idx}"
+        ii += 1
+
+    # Render each gallery pose with GSplat and save results
     for pose in tqdm(gallery["poses"], desc="GS gallery rendering"):
-        idx = int(pose["index"])
+        idx = pose["index"]
         out_name = f"{idx:04d}.png"
-        out_path = output_dir / out_name
 
         R = np.array(pose["R_obj_to_cam"], dtype=np.float32)
         t = np.array(pose["t_obj_to_cam"], dtype=np.float32)
@@ -391,16 +410,34 @@ def run_render_gallery(args, gaussians=None):
             rgb_bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(output_dir / f"{idx:04d}.png"), rgb_bgr)
 
+            g_crop_bbox, bgr_crop = extract_bbox_and_crop(rgb_bgr, margin=12, thresh=8)
+            gallery_bboxes.append(g_crop_bbox)
+            assert len(gallery_bboxes) == idx + 1, f"Index mismatch: expected {idx}, got {len(gallery_bboxes)-1}"
+
+            cv2.imwrite(str(render_crop_dir / f"{idx:04d}c.png"), bgr_crop)            
+
             depth_np = None
-            if args.save_depth and depth_hw is not None:
-                depth_np = save_depth_npy_and_vis(
-                    depth_tensor=depth_hw,
-                    npy_path=depth_dir / f"{idx:04d}.npy",
-                    vis_path=depth_vis_dir / f"{idx:04d}.png",
-                )
+            if args.save_depth:
+                assert depth_hw.ndim == 2, f"Expected depth tensor to have 2 dimensions (H,W), got {depth_hw.shape}. If it has 3 dims, add squeeze"
+                depth_np = depth_hw.detach().cpu().numpy()
+                assert depth_np.dtype == np.float32, f"Expected depth tensor to be float32, got {depth_np.dtype}"
+
+                # save depth data
+                depth_path = depth_dir / f"{idx:04d}.npy"
+                np.save(str(depth_path), depth_np)
+
+                # save cropped depth data
+                depth_crop = crop_with_bbox(depth_np, g_crop_bbox)
+                fn_crop = depth_dir / f"{idx:04d}c.npy"
+                np.save(str(fn_crop), depth_crop)
+
+                # save depth visualization for sanity check
+                depth_img = get_depth_img(depth_np)
+                cv2.imwrite(str(depth_vis_dir / f"{idx:04d}.png"), depth_img)
 
             if args.save_xyz:
-                if depth_np is None and depth_hw is not None:
+                if depth_np is None:
+                    assert depth_hw.ndim == 2, f"Expected depth tensor to have 2 dimensions (H,W), got {depth_hw.shape}. If it has 3 dims, add squeeze"
                     depth_np = depth_hw.detach().cpu().numpy()
 
                 # gsplat depth output is already in metric units (same unit as
@@ -413,9 +450,11 @@ def run_render_gallery(args, gaussians=None):
                     depth_np=depth_np,
                     fx=fx, fy=fy, cx=cx, cy=cy,
                     R_obj_to_cam=pose["R_obj_to_cam"],
-                    t_obj_to_cam=pose["t_obj_to_cam"],
+                    t_obj_to_cam=pose["t_obj_to_cam"]
                 )
-                np.save(str(xyz_dir / f"{idx:04d}.npy"), xyz_obj.astype(np.float16))
+                np.save(str(xyz_dir / f"{idx:04d}.npy"), xyz_obj)
+                xyz_obj_crop = crop_with_bbox(xyz_obj, g_crop_bbox)
+                np.save(str(xyz_dir / f"{idx:04d}c.npy"), xyz_obj_crop)
 
                 save_xyz_reprojection_check(
                     render_bgr=rgb_bgr,
@@ -444,14 +483,66 @@ def run_render_gallery(args, gaussians=None):
 
     save_json(output_dir / "render_meta.json", render_meta)
 
-    print("=" * 60)
-    print("[render_gallery.py] Done")
-    print(f"  output_dir : {output_dir}")
-    print("=" * 60)
+    # save bounding boxes of gallery for later reference
+    gallery_bboxes = np.array(gallery_bboxes, dtype=np.int32)
+    np.save(output_dir / "gallery_bboxes.npy", gallery_bboxes)
+
+    return gallery_bboxes
+
+
+def extract_dino_features(args, gallery_bboxes):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device != "cuda":
+        raise RuntimeError("This renderer is expected to run on CUDA.")
+    
+    bbox_size = get_max_bbox_size(gallery_bboxes)
+    
+    extractor = DinoV2Extractor(args.dino_model, device=device) 
+    dino_in_size = args.dino_input_size
+
+    cache_dir = Path(args.output_dir).parent.parent / "can_data" / "dino_cache_3dgs_1920"
+    if not (Path(args.output_dir).parent.parent / "can_data").exists():
+        cache_dir = Path(args.output_dir) / "dino_cache_3dgs"
+    print(f"  DINOv2 cache dir: {cache_dir}")
+
+    features = torch.zeros( size=[len(gallery_bboxes), 384*4], dtype=torch.float32 )  
+
+    for idx in tqdm(range(len(gallery_bboxes)), desc="DINO feature extraction"):
+        img_path = Path(args.output_dir) / f"{idx:04d}.png"
+        img_rgb = load_rgb(img_path)
+        assert img_rgb.shape[1] == args.width and img_rgb.shape[0] == args.height, f"Image size mismatch: expected ({args.height}, {args.width}), got {img_rgb.shape[:2]}"
+
+        bbox_ext = square_bbox(gallery_bboxes[idx], bbox_size)
+        gallery_crop = crop_with_bbox(img_rgb, bbox_ext)
+
+        # 4 tiles of DINO input, each tile gets a quarter of the original bbox crop (with some shared margin)
+        gallery_crop_dino = square_pad_resize(gallery_crop, dino_in_size * 2)  
+        feat = extractor.encode_4rgb(gallery_crop_dino)
+        assert feat.shape == (384*4,), f"Unexpected DINO feature shape: {feat.shape}"
+
+        features[idx] = feat
+
+        feat = feat.numpy()
+        cache_feat_path = cache_dir / f"{idx:04d}_{args.dino_model.replace('/', '_')}.npy"
+        np.save(str(cache_feat_path), feat)
+
+    features_np = features.numpy()
+    np.save( str(cache_dir / f"gallery_features_{args.dino_model.replace('/', '_')}.npy"), features_np)
+    
+    return features # (3024, 1536) CPU tensor
 
 
 def main():
-    run_render_gallery(parse_args())
+    args = parse_args()
+    # gallery_bboxes = run_render_gallery(args)
+    gallery_bboxes = np.load(Path(args.output_dir) / "gallery_bboxes.npy")
+
+    extract_dino_features(args, gallery_bboxes)
+
+    print("=" * 60)
+    print("[render_gallery.py] Done")
+    print(f"  output_dir : {args.output_dir}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

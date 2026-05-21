@@ -33,31 +33,6 @@ def list_gallery_images(gallery_dir: Path) -> List[Path]:
     return files
 
 
-def compute_nonblack_bbox(img_bgr: np.ndarray, thresh: int = 8) -> Tuple[int, int, int, int]:
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    ys, xs = np.where(gray > thresh)
-    h, w = gray.shape
-    if len(xs) == 0 or len(ys) == 0:
-        return 0, 0, w, h
-    x1, x2 = xs.min(), xs.max() + 1
-    y1, y2 = ys.min(), ys.max() + 1
-    return int(x1), int(y1), int(x2), int(y2)
-
-
-def expand_bbox(bbox, margin, w, h):
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, x1 - margin)
-    y1 = max(0, y1 - margin)
-    x2 = min(w, x2 + margin)
-    y2 = min(h, y2 + margin)
-    return int(x1), int(y1), int(x2), int(y2)
-
-
-def crop_with_bbox(img_bgr, bbox):
-    x1, y1, x2, y2 = bbox
-    return img_bgr[y1:y2, x1:x2].copy()
-
-
 def square_pad_resize(img_bgr: np.ndarray, size: int = 224) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     side = max(h, w)
@@ -112,18 +87,11 @@ def make_query_vs_best_image(query_crop, best_crop, out_size=320):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     return canvas
 
-def load_rgb(path):
+def load_bgr(path):
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Failed to load image: {path}")
     return img
-
-def tight_crop_nonblack(img_bgr, thresh=8, margin=12):
-    h, w = img_bgr.shape[:2]
-    bbox = compute_nonblack_bbox(img_bgr, thresh=thresh)
-    bbox = expand_bbox(bbox, margin, w, h)
-    crop = crop_with_bbox(img_bgr, bbox)
-    return crop, bbox
 
 class DinoV2Extractor:
     def __init__(self, model_name: str, device: str = 'cuda'):
@@ -158,6 +126,28 @@ class DinoV2Extractor:
             feat = out.last_hidden_state[:, 0]
         feat = F.normalize(feat, dim=-1)
         return feat.squeeze(0).detach().cpu()
+    
+    @torch.no_grad()
+    def encode_rgb(self, img_rgb: np.ndarray) -> torch.Tensor:
+        inputs = self.processor(images=img_rgb, return_tensors='pt')
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        out = self.model(**inputs)
+        if hasattr(out, 'pooler_output') and out.pooler_output is not None:
+            feat = out.pooler_output
+        else:
+            feat = out.last_hidden_state[:, 0]
+        feat = F.normalize(feat, dim=-1)
+        return feat.squeeze(0).detach().cpu()
+    
+    @torch.no_grad()
+    def encode_4rgb(self, img_rgb: np.ndarray) -> torch.Tensor:
+        assert img_rgb.shape[0] == 224 * 2 and img_rgb.shape[1] == 224 * 2, "Input must be 448x448 RGB image containing 4 tiles"
+
+        feat0 = self.encode_rgb(img_rgb[:224, :224])
+        feat1 = self.encode_rgb(img_rgb[:224, 224:])
+        feat2 = self.encode_rgb(img_rgb[224:, :224])
+        feat3 = self.encode_rgb(img_rgb[224:, 224:])
+        return torch.row_stack( (feat0, feat1, feat2, feat3) ).reshape(-1)
 
 
 def run_step4_dino_retrieval(args):

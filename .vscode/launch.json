@@ -26,7 +26,9 @@
                 "--save_xyz",
                 "--depth_dir", "data/can_data/gallery_depth_gs_ds",
                 "--depth_vis_dir", "data/can_data/gallery_depth_vis_gs_ds",
-                "--xyz_dir", "data/can_data/gallery_xyz_gs_ds"
+                "--xyz_dir", "data/can_data/gallery_xyz_gs_ds",
+                "--dino_model", "dinov2_vits14",
+                "--dino_input_size", "224"
             ]
         },
         {
@@ -57,7 +59,7 @@
             ]
         },
         {
-            "name": "Python Debugger: Step 5",
+            "name": "Python Debugger: Step 5 PnP",
             "type": "debugpy",
             "request": "launch",
             "program": "main_6d.py",

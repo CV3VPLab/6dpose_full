@@ -4,9 +4,10 @@ retrieval_dino_loftr.py
 step5: DINOv2 LoFTR 
 """
 
-import hashlib
+import time
 import json
 from pathlib import Path
+from tqdm import tqdm
 
 import cv2
 import numpy as np
@@ -15,93 +16,34 @@ import torch.nn.functional as F
 import kornia.feature as KF
 
 from .retrieval_dino import (
-    ensure_dir,
-    load_rgb,
-    tight_crop_nonblack,
-    square_pad_resize,
-    save_json,
     make_query_vs_best_image,
-    DinoV2Extractor,
-    compute_nonblack_bbox,
-    expand_bbox,
-    crop_with_bbox,
+    DinoV2Extractor
 )
 
+from modules_6d.io_utils import (
+    ensure_dir, 
+    save_json
+)
+from utils.image_utils import (
+    expand_bbox, 
+    crop_with_bbox,
+    get_max_bbox_size,
+    square_bbox,
+    square_pad_resize,
+    load_rgb,
+    zeropad_square,
+    compute_bbox,
+    unmap_to_full_image
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DINOv2 feature cache
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _file_hash(path: Path) -> str:
-    """파일 내용 기반 MD5 해시 (캐시 유효성 확인용)"""
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def load_or_compute_gallery_features(
-    gallery_files: list,
-    extractor: DinoV2Extractor,
-    cache_dir: Path,
-    model_name: str,
-    nonblack_thresh: int,
-    crop_margin: int,
-) -> dict:
-    ensure_dir(cache_dir)
-    cache_index_path = cache_dir / f"gallery_feat_index_{model_name.replace('/', '_')}.json"
-
-    if cache_index_path.exists():
-        with open(cache_index_path, "r") as f:
-            cache_index = json.load(f)
-    else:
-        cache_index = {}
-
-    results = {}
-    updated = False
-
-    for gp in gallery_files:
-        key = gp.name
-        file_hash = _file_hash(gp)
-        cache_feat_path = cache_dir / f"{gp.stem}_{model_name.replace('/', '_')}.npy"
-
-        if (key in cache_index
-                and cache_index[key].get("hash") == file_hash
-                and cache_feat_path.exists()):
-            feat = np.load(str(cache_feat_path))
-            print(f"  [Cache HIT ] {key}")
-        else:
-            gimg = load_rgb(gp)
-            gh, gw = gimg.shape[:2]
-            gbox = compute_nonblack_bbox(gimg, thresh=nonblack_thresh)
-            gbox = expand_bbox(gbox, crop_margin, gw, gh)
-            gcrop = crop_with_bbox(gimg, gbox)
-            gin = square_pad_resize(gcrop, 224)
-            feat_tensor = extractor.encode_bgr(gin)
-            feat = feat_tensor.numpy()
-
-            np.save(str(cache_feat_path), feat)
-            cache_index[key] = {"hash": file_hash}
-            updated = True
-            print(f"  [Cache MISS] {key} → computed & saved")
-
-        results[key] = {"feat": feat, "path": str(gp)}
-
-    if updated:
-        with open(cache_index_path, "w") as f:
-            json.dump(cache_index, f, indent=2)
-        print(f"  [Cache] index updated → {cache_index_path.name}")
-
-    return results
-
+TIME_CHECK = False        
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LoFTR helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def image_to_loftr_tensor(img_bgr, device="cuda"):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_RGB2GRAY)
     x = torch.from_numpy(gray).float()[None, None] / 255.0
     return x.to(device)
 
@@ -119,100 +61,13 @@ def compute_loftr_matches(matcher, img0_bgr, img1_bgr, device="cuda"):
     return mkpts0, mkpts1, conf
 
 
-def estimate_inliers(mkpts0, mkpts1, ransac_thresh=3.0):
-    if len(mkpts0) < 4:
-        return None, np.zeros(len(mkpts0), dtype=bool)
-    H, mask = cv2.findHomography(
-        mkpts0, mkpts1,
-        method=cv2.RANSAC,
-        ransacReprojThreshold=ransac_thresh,
-    )
-    if mask is None:
-        return H, np.zeros(len(mkpts0), dtype=bool)
-    return H, mask.ravel().astype(bool)
-
-
-def draw_loftr_matches(img0, img1, mkpts0, mkpts1, conf, inlier_mask, out_path, max_draw=400):
-    h0, w0 = img0.shape[:2]
-    h1, w1 = img1.shape[:2]
-    H = max(h0, h1)
-    canvas = np.zeros((H, w0 + w1, 3), dtype=np.uint8)
-    canvas[:h0, :w0] = img0
-    canvas[:h1, w0:] = img1
-
-    idx = np.arange(len(mkpts0))
-    if len(idx) > max_draw:
-        idx = np.argsort(-conf)[:max_draw]
-
-    for i in idx:
-        p0 = tuple(np.round(mkpts0[i]).astype(int))
-        p1 = tuple(np.round(mkpts1[i]).astype(int) + np.array([w0, 0]))
-        color = (0, 255, 0) if inlier_mask[i] else (0, 0, 255)
-        cv2.line(canvas, p0, p1, color, 1, cv2.LINE_AA)
-        cv2.circle(canvas, p0, 2, (0, 255, 255), -1)
-        cv2.circle(canvas, p1, 2, (0, 255, 255), -1)
-
-    cv2.imwrite(str(out_path), canvas)
-
-
-def unmap_from_square_resize(pts_resized, orig_hw, resize_target=840):
-    h, w = orig_hw
-    side = max(h, w)
-    x0 = (side - w) // 2
-    y0 = (side - h) // 2
-    pts_square = np.asarray(pts_resized, dtype=np.float64) * (side / resize_target)
-    return pts_square - np.array([[x0, y0]], dtype=np.float64)
-
-
-def save_best_match_data(
-    out_dir, mkpts0_all, mkpts1_all, conf_all, inlier_mask,
-    query_hw, query_nonblack_bbox_xyxy,
-    gallery_crop_hw, gallery_nonblack_bbox_xyxy, gallery_img_hw,
-    loftr_resize_target=640,
-):
-
-    ensure_dir(out_dir)
-    out_dir = Path(out_dir)
-
-    inlier_pts0 = mkpts0_all[inlier_mask].astype(np.float32)
-    inlier_pts1 = mkpts1_all[inlier_mask].astype(np.float32)
-    inlier_conf = conf_all[inlier_mask].astype(np.float32)
-
-    npz_path = out_dir / "loftr_best_match_data.npz"
-    np.savez(str(npz_path),
-             mkpts0_inlier_840=inlier_pts0,
-             mkpts1_inlier_840=inlier_pts1,
-             conf_inlier=inlier_conf)
-
-    meta = {
-        "loftr_resize_target": loftr_resize_target,
-        "query_crop_hw": list(query_hw),                        # full image HW
-        "query_nonblack_bbox_xyxy": list(query_nonblack_bbox_xyxy),  # [0,0,W,H]
-        "gallery_crop_hw": list(gallery_crop_hw),
-        "gallery_nonblack_bbox_xyxy": [int(v) for v in gallery_nonblack_bbox_xyxy],
-        "gallery_img_hw": list(gallery_img_hw),
-        "note": (
-            "Query: mkpts0 in 840px space of full query image (no crop). "
-            "unmap → full query image coords directly. "
-            "Gallery: mkpts1 in 840px space of gallery crop. "
-            "unmap → add gallery_nonblack_bbox[:2] → full gallery render coords."
-        ),
-    }
-    save_json(out_dir / "loftr_best_match_meta.json", meta)
-    print(f"  [LoFTR] Saved {int(inlier_mask.sum())} inlier match points → {npz_path.name}")
-    return npz_path
-
-def get_mask_inlier_indices(mkpts0_full, mask_path):
+def get_mask_inlier_indices(pts, mask):
     """
     원본 좌표가 마스크 내부에 있는지 확인하여 True/False 리스트 반환
     """
-    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-    if mask is None:
-        return np.ones(len(mkpts0_full), dtype=bool)
-
     h, w = mask.shape
     keep_mask = []
-    for pt in mkpts0_full:
+    for pt in pts:
         x, y = int(round(pt[0])), int(round(pt[1]))
         if 0 <= x < w and 0 <= y < h and mask[y, x] > 0:
             keep_mask.append(True)
@@ -221,6 +76,54 @@ def get_mask_inlier_indices(mkpts0_full, mask_path):
             
     return np.array(keep_mask)
 
+
+def draw_loftr_matches(img0, img1, mkpts0, mkpts1, conf, out_path, max_draw=400):
+    h0, w0 = img0.shape[:2]
+    h1, w1 = img1.shape[:2]
+    H = max(h0, h1)
+    canvas = np.zeros((H, w0 + w1, 3), dtype=np.uint8)
+    canvas[:h0, :w0] = img0
+    canvas[:h1, w0:] = img1
+    canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+
+    idx = np.arange(len(mkpts0))
+    if len(idx) > max_draw:
+        idx = np.argsort(-conf)[:max_draw]
+
+    for i in idx:
+        p0 = tuple(np.round(mkpts0[i]).astype(int))
+        p1 = tuple(np.round(mkpts1[i]).astype(int) + np.array([w0, 0]))
+        color = (0, 255, 0)
+        cv2.line(canvas, p0, p1, color, 1, cv2.LINE_AA)
+        cv2.circle(canvas, p0, 2, (0, 255, 255), -1)
+        cv2.circle(canvas, p1, 2, (0, 255, 255), -1)
+
+    cv2.imwrite(str(out_path), canvas)
+
+
+def save_best_match_data(
+        out_dir,
+        pts0,
+        pts1,
+        conf,
+        best_idx
+    ):
+    ensure_dir(out_dir)
+    out_dir = Path(out_dir)
+
+    assert pts0.dtype == np.float32 and pts1.dtype == np.float32 and conf.dtype == np.float32, "Expected float32 arrays"
+
+    npz_path = out_dir / "loftr_best_match_data.npz"
+    np.savez(str(npz_path),
+             mkpts0 = pts0,
+             mkpts1 = pts1,
+             conf = conf,
+             best_idx = best_idx)
+
+    return npz_path
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,21 +131,15 @@ def get_mask_inlier_indices(mkpts0_full, mask_path):
 def draw_loftr_matches_full(img0_full, img1_full,
                             mkpts0_crop, mkpts1_crop,
                             q_bbox, g_bbox,
-                            q_crop_hw, g_crop_hw,
-                            inlier_mask, out_path,
+                            out_path,
                             loftr_size=840, max_draw=400):
 
-    m0_crop = unmap_from_square_resize(mkpts0_crop, q_crop_hw, loftr_size)
-    m1_crop = unmap_from_square_resize(mkpts1_crop, g_crop_hw, loftr_size)
-
-    # crop → full image
-    m0_full = m0_crop + np.array([[q_bbox[0], q_bbox[1]]], dtype=np.float64)
-    m1_full = m1_crop + np.array([[g_bbox[0], g_bbox[1]]], dtype=np.float64)
+    m0_full = unmap_to_full_image(mkpts0_crop, q_bbox, loftr_size)
+    m1_full = unmap_to_full_image(mkpts1_crop, g_bbox, loftr_size)
 
     h0, w0 = img0_full.shape[:2]
     h1, w1 = img1_full.shape[:2]
 
-    scale = min(h0, h1) / max(h0, h1)
     if h0 > h1:
         img0_vis = cv2.resize(img0_full, (int(w0 * h1 / h0), h1))
         img1_vis = img1_full.copy()
@@ -257,280 +154,231 @@ def draw_loftr_matches_full(img0_full, img1_full,
     canvas = np.zeros((H_vis, W0_vis + W1_vis, 3), dtype=np.uint8)
     canvas[:, :W0_vis] = img0_vis
     canvas[:, W0_vis:] = img1_vis
+    canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
 
     n = len(mkpts0_crop)
-    idx = np.arange(n)
     if n > max_draw:
-        idx = idx[:max_draw]
+        shuffle_idx = np.random.permutation(n)
+        idx = shuffle_idx[:max_draw]
+    else:
+        idx = np.arange(n)
 
     for i in idx:
         p0 = (int(round(m0_full[i, 0] * sc0)), int(round(m0_full[i, 1] * sc0)))
         p1 = (int(round(m1_full[i, 0] * sc1 + W0_vis)), int(round(m1_full[i, 1] * sc1)))
-        color = (0, 255, 0) if inlier_mask[i] else (0, 0, 255)
+        color = (0, 255, 0)
         cv2.line(canvas, p0, p1, color, 1, cv2.LINE_AA)
         cv2.circle(canvas, p0, 3, (0, 255, 255), -1)
         cv2.circle(canvas, p1, 3, (0, 255, 255), -1)
 
-    cv2.putText(canvas, f"Full image  inliers={int(inlier_mask.sum())}/{n}",
+    cv2.putText(canvas, f"Full image  inliers={n}",
                 (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 230, 230), 2, cv2.LINE_AA)
     cv2.imwrite(str(out_path), canvas)
 
 
-def run_step5_dino_loftr_rerank(args):
+def retrieve_topk(query, query_mask, q_bbox, g_bbox_size, gfeats, extractor, dino_size, topk):
+    # KSCHOI TODO: occlusion 상황에서 topk가 의미 있는지 확인 (현재는 DINO feature similarity top-1만 사용함)
+
+    # query bounding box can be larger than gallery bbox, so we use the max of both for square cropping
+    q_bbox_size = max( g_bbox_size, q_bbox[2] - q_bbox[0], q_bbox[3] - q_bbox[1] )
+    q_bbox_ext = square_bbox(q_bbox, q_bbox_size)
+    query_crop = crop_with_bbox(query, q_bbox_ext)
+    
+    # A cropped query image for extracting DINOv2 feature
+    query_dino_in = square_pad_resize(query_crop, dino_size * 2)
+    qfeat = extractor.encode_4rgb(query_dino_in)
+    # qfeat = extractor.encode_rgb(query_dino_in)    
+    
+    scores = (gfeats @ qfeat).numpy()
+    topk_items = np.argsort(scores)[-topk:][::-1]
+
+    return topk_items, scores[topk_items], query_crop, q_bbox_ext
+
+
+def retrieve_match(query_info, gallery_info, feat_extractor_info, matcher_info, out_dir=None):
+    # KSCHOI TODO: occlusion 상황에서 topk가 의미 있는지 확인 (현재는 DINO feature similarity top-1만 사용함)
+    query = query_info["query_full"]
+    query_mask = query_info["query_mask"]
+    q_bbox = query_info["q_bbox"]
+    
+    gallery_crops = gallery_info["gallery_crops"]
+    g_bboxes = gallery_info["g_bboxes"]
+    gfeats = gallery_info["gfeats"]
+
+    extractor = feat_extractor_info["extractor"]
+    dino_size = feat_extractor_info["input_size"]
+    topk = feat_extractor_info["topk"]
+    
+    matcher = matcher_info["matcher"]
+    conf_thresh = matcher_info["conf_thresh"]
+    device = matcher_info["device"]
+
+    bbox_size = get_max_bbox_size(g_bboxes)
+
+    if TIME_CHECK:
+        start_time = time.perf_counter()
+
+    topk_items, scores, query_crop, q_bbox_ext = retrieve_topk(query, query_mask, q_bbox, bbox_size, gfeats, extractor, dino_size, topk)
+
+    if TIME_CHECK:
+        end_time = time.perf_counter()
+        print(f"  Feature-based Retrieval time : {end_time - start_time:.6f} seconds")
+
+    item = topk_items[0]
+
+    g_bbox = g_bboxes[item]
+    g_bbox_ext = square_bbox(g_bbox, bbox_size)
+
+    g_crop_hw = gallery_crops[item].shape[:2]
+    assert g_bbox[2] - g_bbox[0] == g_crop_hw[1] and g_bbox[3] - g_bbox[1] == g_crop_hw[0], f"Gallery crop size mismatch with bbox, check loading and cropping logic for gallery item {item}"
+
+    gallery_crop = zeropad_square(gallery_crops[item], bbox_size)
+
+    # ── LoFTR rerank ───────────────────────────────────────────────────────
+    LOFTR_SIZE = 840
+    query_l = square_pad_resize(query_crop, LOFTR_SIZE)
+    gallery_l = square_pad_resize(gallery_crop, LOFTR_SIZE)
+    
+    # mkpts0: query crop 좌표계, mkpts1: gallery crop 좌표계, conf: 매칭 confidence
+    if TIME_CHECK:  
+        start_time = time.perf_counter()
+    
+    mkpts0, mkpts1, conf = compute_loftr_matches(matcher, query_l, gallery_l, device=device)
+
+    if TIME_CHECK:
+        end_time = time.perf_counter()
+        print(f"  LoFTR matching time : {end_time - start_time:.6f} seconds")
+
+    valid = conf >= conf_thresh
+    mkpts0, mkpts1, conf = mkpts0[valid], mkpts1[valid], conf[valid]
+
+    # 마스크 필터링: query crop coords → full image coords → mask 체크
+    pts0_full = unmap_to_full_image(mkpts0, q_bbox_ext, LOFTR_SIZE)
+    mask_keep = get_mask_inlier_indices(pts0_full, query_mask)
+
+    mkpts0 = mkpts0[mask_keep]
+    mkpts1 = mkpts1[mask_keep]
+    conf   = conf[mask_keep]
+
+    pts0_full = pts0_full[mask_keep]
+    pts1_full = unmap_to_full_image(mkpts1, g_bbox_ext, LOFTR_SIZE)
+
+    # crop 공간 시각화
+    if out_dir is not None:
+        vis_path = out_dir / f"loftr_vis_{item:04d}.png"
+        draw_loftr_matches(query_l, gallery_l, mkpts0, mkpts1, conf, vis_path)
+
+    return pts0_full, pts1_full, conf, item
+
+
+def  run_step5_dino_loftr_rerank(args):
     """
     DINOv2 retrieval + LoFTR rerank 통합.
     query_masked_path: query_masked_full.png (full 해상도, 배경 검정)
+    query_image: RGB image 가정 (sensor로부터 얻어질 때 RGB라 가정)
     """
     if args.dino_scores_json is None:
         pass
 
-    out_dir = Path(args.out_dir)
-    ensure_dir(out_dir)
     device = args.device if torch.cuda.is_available() else "cpu"
 
-    # ── 1. Query 로드 ─────────────────────────────────────────────────────────
-    query_masked_full_path = Path(args.out_dir) / "query_masked_full.png"
-    if not query_masked_full_path.exists():
-        print(f"  [WARN] query_masked_full.png not found, falling back to query_masked_path")
-        query_masked_full_path = Path(args.query_masked_path)
-
-    query_full = load_rgb(str(query_masked_full_path))
-    qh, qw = query_full.shape[:2]
-    print(f"  Query full image: {qw}x{qh}")
-
-    LOFTR_SIZE = 840
-
-    # ── step1 bbox로 query crop → LoFTR 입력 ─────────────────────────────────
-    step1_json_path = Path(args.out_dir) / "step1_result.json"
-    q_loftr_bbox = None
-    if step1_json_path.exists():
-        with open(step1_json_path) as f:
-            step1_data = json.load(f)
-        raw_bbox = step1_data.get("mask_bbox_xyxy") or step1_data.get("bbox_xyxy")
-        if raw_bbox is not None:
-            q_loftr_bbox = list(expand_bbox(raw_bbox, args.crop_margin, qw, qh))
-            print(f"  [LoFTR] Query crop from step1 bbox: {q_loftr_bbox}")
-
-    if q_loftr_bbox is None:
-        q_loftr_bbox = [0, 0, qw, qh]
-        print(f"  [LoFTR] step1 bbox not found, using full image")
-
-    query_loftr_crop = crop_with_bbox(query_full, q_loftr_bbox)
-    q_loftr_h, q_loftr_w = query_loftr_crop.shape[:2]
-    query_l = square_pad_resize(query_loftr_crop, LOFTR_SIZE)
-    print(f"  [LoFTR] Query crop size: {q_loftr_w}x{q_loftr_h} → {LOFTR_SIZE}px")
-
-    # ── 2. Gallery 파일 목록 ──────────────────────────────────────────────────
+    out_dir = Path(args.out_dir)
+    data_dir = Path(args.out_dir).parent.parent
+    ensure_dir(data_dir)
+    
     gallery_dir = Path(args.gallery_dir)
-    exts = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
-    gallery_files = sorted([p for p in gallery_dir.iterdir() if p.suffix.lower() in exts])
-    if not gallery_files:
-        raise FileNotFoundError(f"No gallery images in: {gallery_dir}")
-    print(f"  Gallery: {len(gallery_files)} images in {gallery_dir}")
-
-    # ── 3. DINOv2 feature (캐시 활용) ────────────────────────────────────────
-    extractor = DinoV2Extractor(args.dino_model, device=device)
-    qbox = compute_nonblack_bbox(query_full, thresh=args.nonblack_thresh)
-    qbox = expand_bbox(qbox, args.crop_margin, qw, qh)
-    query_crop_for_dino = crop_with_bbox(query_full, qbox)
-    query_dino_in = square_pad_resize(query_crop_for_dino, args.dino_input_size)
-    qfeat = extractor.encode_bgr(query_dino_in)
-
-    cache_dir = Path(args.out_dir).parent.parent / "can_data" / "dino_cache_3dgs_1920"
-    if not (Path(args.out_dir).parent.parent / "can_data").exists():
-        cache_dir = Path(args.out_dir) / "dino_cache_3dgs"
+    g_bboxes = np.load(gallery_dir / "gallery_bboxes.npy")
+    
+    cache_dir = data_dir / "can_data" / "dino_cache_3dgs_1920"    
     print(f"  DINOv2 cache dir: {cache_dir}")
 
-    gallery_feats = load_or_compute_gallery_features(
-        gallery_files=gallery_files,
-        extractor=extractor,
-        cache_dir=cache_dir,
-        model_name=args.dino_model,
-        nonblack_thresh=args.nonblack_thresh,
-        crop_margin=args.crop_margin,
-    )
+    gallery_feats = np.load( str(cache_dir / f"gallery_features_{args.dino_model.replace('/', '_')}.npy") )
+    gfeats = torch.from_numpy(gallery_feats) # (N_gallery, D_feat) tensor
 
-    # ── 4. DINOv2 cosine similarity → top-K ──────────────────────────────────
-    scores = []
-    for gp in gallery_files:
-        key = gp.name
-        gfeat = torch.from_numpy(gallery_feats[key]["feat"])
-        score = float(torch.dot(qfeat, gfeat).item())
-        scores.append({
-            "file": key,
-            "path": str(gp),
-            "score_cosine": score,
-        })
+    # Cropped gallery images load
+    gallery_crops = []
+    for idx in tqdm(range(len(g_bboxes)), desc="Loading gallery crops"):
+        gpath = gallery_dir.parent / f"gallery_renders_crop_gs_ds/{idx:04d}c.png"
+        img_rgb = load_rgb(str(gpath))
+        gallery_crops.append(img_rgb)
+     
+    # ── 1. Query 로드 ─────────────────────────────────────────────────────────
+    query_masked_path = Path(args.out_dir) / "query_masked_full.png"
+    if not query_masked_path.exists():
+        print(f"  [WARN] query_masked_full.png not found, falling back to query_masked_path")
+        query_masked_path = Path(args.query_masked_path)
 
-    scores_sorted = sorted(scores, key=lambda x: x["score_cosine"], reverse=True)
-    topk_items = scores_sorted[:args.topk]
-    print(f"  DINOv2 top-{args.topk}: {[x['file'] for x in topk_items]}")
+    query_full = load_rgb(str(query_masked_path))
+    qh, qw = query_full.shape[:2]
+    print(f"  Masked query full image: {qw}x{qh}")
 
-    dino_scores_path = out_dir / "retrieval_scores.json"
-    save_json(dino_scores_path, {
-        "stage": "step5",
-        "sim_method": "dino",
-        "query_masked_path": str(query_masked_full_path),
-        "gallery_dir": str(gallery_dir),
-        "dino_model": args.dino_model,
-        "num_gallery": len(gallery_files),
-        "topk": topk_items,
-        "all_scores_sorted": scores_sorted,
-    })
+    query_mask_path = out_dir / "query_mask.png"
+    query_mask = cv2.imread(str(query_mask_path), cv2.IMREAD_GRAYSCALE)
+    if query_mask is None:
+        assert False, f"Query mask not found at: {query_mask_path}"
 
-    # ── 5. LoFTR rerank ───────────────────────────────────────────────────────
+    q_bbox = compute_bbox(query_mask)
+
+    
+    # DINOv2 extractor 초기화
+    extractor = DinoV2Extractor(args.dino_model, device=device)
+    # LoFTR 초기화
     matcher = KF.LoFTR(pretrained=args.loftr_pretrained).to(device).eval()
-
-    results = []
-    match_cache = {}
-
-    query_mask_path = Path(args.out_dir) / "query_mask.png"
-
-    for item in topk_items:
-        gpath = Path(item["path"])
-        gimg = load_rgb(str(gpath))
-        gh, gw = gimg.shape[:2]
-
-        # gallery: nonblack bbox crop → LoFTR 입력
-        g_loftr_bbox = list(compute_nonblack_bbox(gimg, thresh=args.nonblack_thresh))
-        g_loftr_bbox = list(expand_bbox(g_loftr_bbox, args.crop_margin, gw, gh))
-        gallery_loftr_crop = crop_with_bbox(gimg, g_loftr_bbox)
-        g_loftr_h, g_loftr_w = gallery_loftr_crop.shape[:2]
-        gallery_l = square_pad_resize(gallery_loftr_crop, LOFTR_SIZE)
-
-        mkpts0, mkpts1, conf = compute_loftr_matches(matcher, query_l, gallery_l, device=device)
-
-        valid = conf >= args.loftr_conf_thresh
-        mkpts0_v, mkpts1_v, conf_v = mkpts0[valid], mkpts1[valid], conf[valid]
-
-        # 마스크 필터링: query crop coords → full image coords → mask 체크
-        m0_crop_temp = unmap_from_square_resize(mkpts0_v, (q_loftr_h, q_loftr_w), resize_target=LOFTR_SIZE)
-        m0_full_temp = m0_crop_temp + np.array([[q_loftr_bbox[0], q_loftr_bbox[1]]])
-        mask_keep = get_mask_inlier_indices(m0_full_temp, query_mask_path)
-
-        mkpts0_v = mkpts0_v[mask_keep]
-        mkpts1_v = mkpts1_v[mask_keep]
-        conf_v   = conf_v[mask_keep]
-
-        H_mat, inlier_mask = estimate_inliers(mkpts0_v, mkpts1_v, ransac_thresh=args.loftr_ransac_thresh)
-
-        total_matches = len(conf_v)
-        inliers       = int(inlier_mask.sum()) if total_matches > 0 else 0
-        mean_conf     = float(conf_v.mean())   if total_matches > 0 else 0.0
-        inlier_ratio  = float(inliers / total_matches) if total_matches > 0 else 0.0
-
-        results.append({
-            "file": item["file"],
-            "path": item["path"],
-            "dino_score": item["score_cosine"],
-            "total_matches": total_matches,
-            "inliers": inliers,
-            "mean_conf": mean_conf,
-            "inlier_ratio": inlier_ratio,
-        })
-
-        match_cache[item["file"]] = {
-            "mkpts0_all":  mkpts0_v,
-            "mkpts1_all":  mkpts1_v,
-            "conf_all":    conf_v,
-            "inlier_mask": inlier_mask,
-            "q_loftr_bbox":  q_loftr_bbox,
-            "q_loftr_hw":    (q_loftr_h, q_loftr_w),
-            "g_loftr_bbox":  g_loftr_bbox,
-            "g_loftr_hw":    (g_loftr_h, g_loftr_w),
-            "gimg_hw":       (gh, gw),
-            "query_l":       query_l,
-            "gallery_l":     gallery_l,
-            "gimg":          gimg,
-        }
-
-        # crop 공간 시각화
-        vis_path = out_dir / f"loftr_vis_{gpath.stem}.png"
-        draw_loftr_matches(query_l, gallery_l, mkpts0_v, mkpts1_v, conf_v, inlier_mask, vis_path)
-
-        # full image 공간 시각화
-        vis_full_path = out_dir / f"loftr_vis_full_{gpath.stem}.png"
-        draw_loftr_matches_full(
-            query_full, gimg,
-            mkpts0_v, mkpts1_v,
-            q_loftr_bbox, g_loftr_bbox,
-            (q_loftr_h, q_loftr_w), (g_loftr_h, g_loftr_w),
-            inlier_mask, vis_full_path,
-            loftr_size=LOFTR_SIZE,
-        )
-
-    # ── 6. LoFTR score로 최종 정렬 ───────────────────────────────────────────
-    max_inliers = max([r["inliers"] for r in results] + [1])
-    for r in results:
-        norm_inliers = r["inliers"] / max_inliers
-        r["loftr_score"] = 0.5 * norm_inliers + 0.3 * r["mean_conf"] + 0.2 * r["inlier_ratio"]
-
-    results = sorted(results, key=lambda x: x["loftr_score"], reverse=True)
-    best = results[0]
-
-    # ── 7. Best match 데이터 저장 ─────────────────────────────────────────────
-    best_cache = match_cache[best["file"]]
-    save_best_match_data(
-        out_dir=out_dir,
-        mkpts0_all=best_cache["mkpts0_all"],
-        mkpts1_all=best_cache["mkpts1_all"],
-        conf_all=best_cache["conf_all"],
-        inlier_mask=best_cache["inlier_mask"],
-        query_hw=best_cache["q_loftr_hw"],
-        query_nonblack_bbox_xyxy=best_cache["q_loftr_bbox"],
-        gallery_crop_hw=best_cache["g_loftr_hw"],
-        gallery_nonblack_bbox_xyxy=best_cache["g_loftr_bbox"],
-        gallery_img_hw=best_cache["gimg_hw"],
-        loftr_resize_target=LOFTR_SIZE,
-    )
-
-    # ── 8. 시각화 ─────────────────────────────────────────────────────────────
-    best_render_img = best_cache["gimg"]
-    best_gcrop_for_vis, _ = tight_crop_nonblack(
-        best_render_img, thresh=args.nonblack_thresh, margin=args.crop_margin
-    )
-    query_best_vis = make_query_vs_best_image(query_crop_for_dino, best_gcrop_for_vis)
-    cv2.imwrite(str(out_dir / "query_vs_best_reranked.png"), query_best_vis)
-
-    # crop 공간 best match 시각화 복사
-    best_match_vis_src = out_dir / f"loftr_vis_{Path(best['file']).stem}.png"
-    best_match_vis_dst = out_dir / "loftr_matches_best.png"
-    if best_match_vis_src.exists():
-        best_match_vis_dst.write_bytes(best_match_vis_src.read_bytes())
-
-    # full image 공간 best match 시각화 복사
-    best_match_vis_full_src = out_dir / f"loftr_vis_full_{Path(best['file']).stem}.png"
-    best_match_vis_full_dst = out_dir / "loftr_matches_best_full.png"
-    if best_match_vis_full_src.exists():
-        best_match_vis_full_dst.write_bytes(best_match_vis_full_src.read_bytes())
-
-    # ── 9. 결과 저장 ──────────────────────────────────────────────────────────
-    summary = {
-        "stage": "step5_dino_loftr",
-        "sim_method": "dino_loftr",
-        "query_masked_full": str(query_masked_full_path),
-        "gallery_dir": str(gallery_dir),
-        "dino_model": args.dino_model,
-        "loftr_pretrained": args.loftr_pretrained,
-        "loftr_conf_thresh": args.loftr_conf_thresh,
-        "loftr_ransac_thresh": args.loftr_ransac_thresh,
-        "best_render": best["file"],
-        "best_loftr_score": best["loftr_score"],
-        "results_sorted": results,
-        "loftr_best_match_npz": str(out_dir / "loftr_best_match_data.npz"),
-        "loftr_best_match_meta": str(out_dir / "loftr_best_match_meta.json"),
+    
+    #######################################################
+    # Inputs for LoFTR reranking
+    # Data ::
+    #######################################################
+    query_info = {
+        "query_full": query_full,   # full query image (RGB)
+                                    # KSCHOI TODO: currently, masked query image is used as full image, 
+                                    # but ideally should be original unmasked RGB query
+        "query_mask": query_mask,   # full query mask (grayscale, 0=background, 255=foreground)
+        "q_bbox": q_bbox            # query bounding box
     }
-    save_json(out_dir / "loftr_scores.json", summary)
-    save_json(out_dir / "step5_rerank_summary.json", {
-        "best_render": best["file"],
-        "best_loftr_score": best["loftr_score"],
-    })
+    gallery_info = {
+        "gallery_crops": gallery_crops, # cropped gallery images according to g_bboxes
+        "g_bboxes": g_bboxes,           # all the bounding boxes of gallery renders
+        "gfeats": gfeats                # DINOv2 features of gallery crops, used for cosine similarity retrieval  
+    }
+
+    #######################################################
+    # Inputs for LoFTR reranking
+    # Model ::
+    #######################################################
+    feat_extractor_info = {
+        "extractor": extractor,                 # DINOv2 feature extractor instance, used for encoding query crop
+        "input_size": args.dino_input_size,
+        "topk": args.topk   
+    }
+    matcher_info = {
+        "matcher": matcher,                     # LoFTR matcher instance, used for computing matches between query crop and gallery crop   
+        "conf_thresh": args.loftr_conf_thresh,
+        "device": device
+    }
+
+    if TIME_CHECK:
+        start_time = time.perf_counter()
+
+    pts0_full, pts1_full, conf, best_idx = retrieve_match(query_info, gallery_info, feat_extractor_info, matcher_info, out_dir=None)
+
+    if TIME_CHECK:
+        end_time = time.perf_counter()
+        print(f"  Feature-based Retrieval & LoFTR matching time : {end_time - start_time:.6f} seconds")
+
+    save_best_match_data(
+        out_dir = out_dir,
+        pts0 = pts0_full,
+        pts1 = pts1_full,
+        conf = conf,
+        best_idx = best_idx
+    )
 
     print("=" * 60)
     print("[Step 5] DINOv2 + LoFTR rerank complete")
-    print(f"  best_render     : {best['file']}")
-    print(f"  best_loftr_score: {best['loftr_score']:.4f}")
+    print(f"  best_render     : {best_idx}")
     print(f"  dino_cache      : {cache_dir}")
     print(f"  loftr_scores    : {out_dir / 'loftr_scores.json'}")
     print(f"  match_vis       : {out_dir / 'loftr_matches_best.png'}")
     print("=" * 60)
+

@@ -9,7 +9,7 @@ import kornia.feature as KF
 
 from modules_6d.retrieval_dino import (
     ensure_dir,
-    load_rgb,
+    load_bgr,
     tight_crop_nonblack,
     square_pad_resize,
     save_json,
@@ -63,7 +63,7 @@ def load_or_compute_gallery_features(
             feat = np.load(str(cache_feat_path))
             print(f"  [Cache HIT ] {key}")
         else:
-            gimg = load_rgb(gp)
+            gimg = load_bgr(gp)
             gh, gw = gimg.shape[:2]
             gbox = compute_nonblack_bbox(gimg, thresh=nonblack_thresh)
             gbox = expand_bbox(gbox, crop_margin, gw, gh)
@@ -196,7 +196,7 @@ def run_step4_dino_loftr_rerank_rt(args, model_cache=None):
         print(f"  [WARN] query_masked_full.png not found, falling back to query_masked_path")
         query_masked_full_path = Path(args.query_masked_path)
 
-    query_full = load_rgb(str(query_masked_full_path))
+    query_full = load_bgr(str(query_masked_full_path))
     qh, qw = query_full.shape[:2]
     print(f"  Query full image: {qw}x{qh}")
 
@@ -302,7 +302,7 @@ def run_step4_dino_loftr_rerank_rt(args, model_cache=None):
 
     for item in topk_items:
         gpath = Path(item["path"])
-        gimg = load_rgb(str(gpath))
+        gimg = load_bgr(str(gpath))
         gh, gw = gimg.shape[:2]
 
         # gallery: nonblack bbox crop → LoFTR 입력
