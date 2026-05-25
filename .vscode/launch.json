@@ -59,7 +59,7 @@
             ]
         },
         {
-            "name": "Python Debugger: Step 5 PnP",
+            "name": "Python Debugger: Step 5 Retrieve gallery & Feature Matching",
             "type": "debugpy",
             "request": "launch",
             "program": "main_6d.py",
@@ -84,7 +84,7 @@
             ]
         },
         {
-            "name": "Python Debugger: Step 6",
+            "name": "Python Debugger: Step 6 PnP",
             "type": "debugpy",
             "request": "launch",
             "program": "main_6d.py",
@@ -100,7 +100,7 @@
                 "--query_img", "data/query_0408/q2_00044_ds.jpg",
                 "--query_masked_path", "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/query_masked_full.png",
                 "--query_mask_path", "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/query_mask.png",
-                "--pnp_reproj_error", "10.0",
+                "--pnp_reproj_error", "4.0",
                 "--axis_len_m", "0.04",
                 "--object_height_m", "0.125",
                 "--canonical_ply_path", "data/can_data/3dgs_pepsi_pinset/pepsi_painted_canonical/point_cloud/iteration_30000/point_cloud.ply",
@@ -112,6 +112,36 @@
                 "--bg_color", "0,0,0",
                 "--t_refine_iou_thresh", "0.30",
                 "--skip_t_refine"
+            ]
+        },
+        {
+            "name": "Python Debugger: Step 7 Refine with Render & Compare",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "refine_pose.py",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "args": [
+                "--model_dir",          "data/can_data/3dgs_pepsi_pinset/pepsi_painted",
+                "--initial_pose_json",  "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/step6_pose.json",
+                "--query_masked_path",  "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/query_masked_full.png",
+                "--query_mask_path",    "data/outputs_0424/q2_00044_3dgs_scale_ds_100iter/query_mask.png",
+                "--intrinsics_path",    "data/can_data/intrinsics_ds.txt",
+                "--output_dir",         "data/can_data/gallery_renders_gs_ds",
+                "--width",              "1920",
+                "--height",             "1080",
+                "--background",         "0,0,0",
+                "--iteration",          "30000",
+                "--sh_degree",          "3",
+                "--iters",              "100",
+                "--lr_rot",             "1e-2",
+                "--lr_trans",           "5e-3",
+                "--warmup_steps",       "10",
+                "--early_stop_steps",   "20",
+                "--early_stop_thresh",  "1e-5",
+                "--crop_size",          "320",
+                "--crop_margin_scale",  "1.3",
+                "--rt_mode"
             ]
         }
     ]
