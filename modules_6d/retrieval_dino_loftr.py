@@ -102,25 +102,21 @@ def draw_loftr_matches(img0, img1, mkpts0, mkpts1, conf, out_path, max_draw=400)
 
 
 def save_best_match_data(
-        out_dir,
+        npz_path,
         pts0,
         pts1,
         conf,
         best_idx
     ):
-    ensure_dir(out_dir)
-    out_dir = Path(out_dir)
+    ensure_dir(npz_path.parent)    
 
     assert pts0.dtype == np.float32 and pts1.dtype == np.float32 and conf.dtype == np.float32, "Expected float32 arrays"
 
-    npz_path = out_dir / "loftr_best_match_data.npz"
     np.savez(str(npz_path),
              mkpts0 = pts0,
              mkpts1 = pts1,
              conf = conf,
              best_idx = best_idx)
-
-    return npz_path
 
 
 
@@ -367,7 +363,7 @@ def  run_step5_dino_loftr_rerank(args):
         print(f"  Feature-based Retrieval & LoFTR matching time : {end_time - start_time:.6f} seconds")
 
     save_best_match_data(
-        out_dir = out_dir,
+        npz_path = out_dir / "loftr_best_match_data.npz",
         pts0 = pts0_full,
         pts1 = pts1_full,
         conf = conf,

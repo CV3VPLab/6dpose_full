@@ -87,11 +87,6 @@ def make_query_vs_best_image(query_crop, best_crop, out_size=320):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     return canvas
 
-def load_bgr(path):
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"Failed to load image: {path}")
-    return img
 
 class DinoV2Extractor:
     def __init__(self, model_name: str, device: str = 'cuda'):

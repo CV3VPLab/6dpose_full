@@ -6,24 +6,16 @@ import sys
 import tempfile
 import csv
 
+import time
+from tqdm import tqdm
+
 import cv2
 import numpy as np
 
+from utils.image_utils import load_bgr
+from utils.geom_utils import rotation_matrix_to_quaternion
 
-def ensure_dir(path):
-    Path(path).mkdir(parents=True, exist_ok=True)
-
-
-def save_json(path, data):
-    path = Path(path)
-    ensure_dir(path.parent)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+from modules_6d.io_utils import  ensure_dir, save_json, load_json
 
 
 def load_intrinsics(path):
@@ -45,55 +37,19 @@ def load_intrinsics(path):
     return K
 
 
-def load_image(path):
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"Failed to load image: {path}")
-    return img
-
-
-def unmap_from_square_resize(pts_resized, orig_hw, resize_target=840):
-    h, w = orig_hw
-    side = max(h, w)
-    x0 = (side - w) // 2
-    y0 = (side - h) // 2
-
-    pts_square = pts_resized * (side / resize_target)
-    pts_crop = pts_square - np.array([[x0, y0]], dtype=np.float32)
-    return pts_crop
-
-
-def to_full_image_coords(pts_crop, offset_xy):
-    pts = pts_crop + offset_xy[None, :]
-    return pts
-
-
-def find_xyz_map_path(xyz_dir: Path, render_filename: str):
-    stem = Path(render_filename).stem
-    candidates = [
-        xyz_dir / f"{stem}c.npy",
-        xyz_dir / f"{stem}_xyz.npy",
-        xyz_dir / f"{stem}_xyz_map.npy",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    raise FileNotFoundError(
-        f"XYZ map not found for '{render_filename}' in {xyz_dir}. "
-        f"Tried: {[str(c) for c in candidates]}"
-    )
-
-
-def lookup_xyz_at_pixels(xyz_map, pts_uv, bilinear=False):
+def lookup_xyz(xyz_map, pts_uv, bilinear=True):
+    assert xyz_map.dtype == np.float64, f"Expected xyz_map to be float64, got {xyz_map.dtype}"
+    
     H, W = xyz_map.shape[:2]
     N = len(pts_uv)
+
     pts3d = np.full((N, 3), np.nan, dtype=np.float64)
 
     if not bilinear:
         u = np.round(pts_uv[:, 0]).astype(int)
         v = np.round(pts_uv[:, 1]).astype(int)
         in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-        pts3d[in_bounds] = xyz_map[v[in_bounds], u[in_bounds]].astype(np.float64)
+        pts3d[in_bounds] = xyz_map[v[in_bounds], u[in_bounds]]
     else:
         for i in range(N):
             uf, vf = pts_uv[i, 0], pts_uv[i, 1]
@@ -106,44 +62,12 @@ def lookup_xyz_at_pixels(xyz_map, pts_uv, bilinear=False):
                    xyz_map[v0, u1] * du * (1-dv) +
                    xyz_map[v1, u0] * (1-du) * dv +
                    xyz_map[v1, u1] * du * dv)
-            pts3d[i] = val.astype(np.float64)
+            pts3d[i] = val
 
     finite = np.all(np.isfinite(pts3d), axis=1)
     nonzero = np.abs(pts3d).sum(axis=1) > 1e-6
     valid = finite & nonzero
     return pts3d, valid
-
-
-def rotation_matrix_to_quaternion(R):
-    R = np.asarray(R, dtype=np.float64)
-    tr = np.trace(R)
-    if tr > 0:
-        S = math.sqrt(tr + 1.0) * 2
-        qw = 0.25 * S
-        qx = (R[2,1] - R[1,2]) / S
-        qy = (R[0,2] - R[2,0]) / S
-        qz = (R[1,0] - R[0,1]) / S
-    elif R[0,0] > R[1,1] and R[0,0] > R[2,2]:
-        S = math.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2]) * 2
-        qw = (R[2,1] - R[1,2]) / S
-        qx = 0.25 * S
-        qy = (R[0,1] + R[1,0]) / S
-        qz = (R[0,2] + R[2,0]) / S
-    elif R[1,1] > R[2,2]:
-        S = math.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2]) * 2
-        qw = (R[0,2] - R[2,0]) / S
-        qx = (R[0,1] + R[1,0]) / S
-        qy = 0.25 * S
-        qz = (R[1,2] + R[2,1]) / S
-    else:
-        S = math.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1]) * 2
-        qw = (R[1,0] - R[0,1]) / S
-        qx = (R[0,2] + R[2,0]) / S
-        qy = (R[1,2] + R[2,1]) / S
-        qz = 0.25 * S
-    q = np.array([qw, qx, qy, qz], dtype=np.float64)
-    q /= np.linalg.norm(q) + 1e-12
-    return q
 
 
 def estimate_t_linear(pts2d, pts3d, K, R):
@@ -285,102 +209,66 @@ def _save_correspondence_debug(out_dir, query_img, gallery_render_path,
         _tb.print_exc()
 
 
-def solve_pose_pnp(pts2d, pts3d, K, R_init,
-                   reproj_thresh=200.0, min_inliers=6,
-                   use_ransac=True):
+def solve_pose_pnp(pts2d, pts3d, K, R0,
+                   reproj_thresh=4.0, min_inliers=6):
+    # pts2d: 32-bit float, (N, 2), full-image coords
+    # pts3d: 64-bit float, (N, 3), object coords
+    # R0: 64-bit float, (3, 3)
+    # K: 64-bit float, (3, 3)
+    N_MIN_PTS = 6
+
+    assert pts2d.dtype == np.float32 and pts3d.dtype == np.float64, "Expected pts2d as float32 and pts3d as float64"    
+    pts2d = pts2d.astype(np.float64)
+    pts3d = pts3d.astype(np.float64)
+
+    assert K.dtype == np.float64 and R0.dtype == np.float64, "Expected K and R0 as float64"
+
     N = len(pts2d)
-    if N < 4:
-        print(f"  [PnP] 2D-3D 대응점 {N}개 < 4, pose 추정 불가")
-        t_linear = estimate_t_linear(pts2d, pts3d, K, R_init) if N > 0 else np.zeros(3, dtype=np.float64)
-        return R_init, t_linear, "linear_T_fixed_R_insufficient_points", 0, np.inf, np.array([], dtype=np.int32)
-
-    dist = np.zeros((4, 1), dtype=np.float64)
-
-    if not use_ransac:
-        rvec_init, _ = cv2.Rodrigues(R_init.astype(np.float64))
-        t_init_linear = estimate_t_linear(pts2d, pts3d, K, R_init)
-
-        retval, rvec, tvec = cv2.solvePnP(
-            pts3d.astype(np.float32),
-            pts2d.astype(np.float32),
-            K.astype(np.float64),
-            dist,
-            rvec=rvec_init,
-            tvec=t_init_linear.reshape(3, 1).astype(np.float64),
-            useExtrinsicGuess=True,
-            flags=cv2.SOLVEPNP_ITERATIVE,
-        )
-
-        if not retval:
-            print(f"  [PnP] No-RANSAC ITERATIVE failed. Using linear T.")
-            return R_init, t_init_linear, "linear_T_fixed_R_no_ransac_failed", 0, np.inf, np.array([], dtype=np.int32)
-
-        R_out, _ = cv2.Rodrigues(rvec)
-        t_out = tvec.ravel()
-        inlier_idx = np.arange(N, dtype=np.int32)
-
-        proj, _ = cv2.projectPoints(
-            pts3d.astype(np.float32), rvec, tvec,
-            K.astype(np.float64), dist
-        )
-        err = np.linalg.norm(proj.reshape(-1, 2) - pts2d, axis=1).mean()
-
-        print(f"  [PnP] No-RANSAC: all {N} pts used, reproj_err={err:.2f}px")
-        return (
-            R_out.astype(np.float64),
-            t_out.astype(np.float64),
-            "pnp_no_ransac_iterative",
-            N,
-            float(err),
-            inlier_idx,
-        )
+    assert N > N_MIN_PTS, f"  [PnP] 2D-3D 대응점 {N}개 < {N_MIN_PTS}, pose 추정 불가"
+        
+    distCoeffs = np.zeros((4, 1), dtype=np.float64)
 
     success, rvec, tvec, inliers = cv2.solvePnPRansac(
-        pts3d.astype(np.float32),
-        pts2d.astype(np.float32),
-        K.astype(np.float64),
-        dist,
-        useExtrinsicGuess=False,
-        iterationsCount=500,
+        pts3d, pts2d,
+        K, distCoeffs,
+        useExtrinsicGuess=False,            
+        iterationsCount=50,
         reprojectionError=reproj_thresh,
         confidence=0.999,
         flags=cv2.SOLVEPNP_EPNP,
+        # rvec=cv2.Rodrigues(R0.astype(np.float64))[0],
+        # tvec=np.zeros((3, 1), dtype=np.float64),
     )
 
-    print(f" [PnP] rvec (rad): {rvec.ravel()}  tvec: {tvec.ravel()}")
-
-    stage1_method = "epnp"
+    print(f" [PnP] rvec: {rvec.ravel()}  tvec: {tvec.ravel()}")
 
     if not success or inliers is None or len(inliers) < min_inliers:
         print(f"  [PnP] Stage 1 (EPnP) failed or insufficient inliers "
               f"({0 if inliers is None else len(inliers)}). Using linear T.")
-        t_linear = estimate_t_linear(pts2d, pts3d, K, R_init)
-        return R_init, t_linear, "linear_T_fixed_R", 0, np.inf, np.array([], dtype=np.int32)
+        t_linear = estimate_t_linear(pts2d, pts3d, K, R0)
+        return R0, t_linear, "linear_T_fixed_R", 0, np.inf, np.array([], dtype=np.int32)
 
     inlier_idx = inliers.ravel().astype(np.int32)
-    print(f"  [PnP] Stage 1 ({stage1_method}): {len(inlier_idx)} inliers / {N} pts")
+    print(f"  [ePnP] Stage 1 : {len(inlier_idx)} inliers / {N} pts")
 
-    if len(inlier_idx) >= 6:
-        pts3d_in = pts3d[inlier_idx].astype(np.float32)
-        pts2d_in = pts2d[inlier_idx].astype(np.float32)
+    assert len(inlier_idx) >= N_MIN_PTS, f"  [PnP] Stage 1 inliers {len(inlier_idx)} < {N_MIN_PTS}, pose refinement skipped"
+    
+    retval, rvec, tvec = cv2.solvePnP(
+        pts3d[inlier_idx],
+        pts2d[inlier_idx],
+        K,
+        distCoeffs,
+        rvec=rvec.copy(),
+        tvec=tvec.copy(),
+        useExtrinsicGuess=True,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if retval:
+        print(f"  [PnP] Stage 2 (ITERATIVE refine on {len(inlier_idx)} inliers): OK")
+    else:
+        print(f"  [PnP] Stage 2 refine failed, using Stage 1 result")
 
-        retval, rvec_ref, tvec_ref = cv2.solvePnP(
-            pts3d_in,
-            pts2d_in,
-            K.astype(np.float64),
-            dist,
-            rvec=rvec.copy(),
-            tvec=tvec.copy(),
-            useExtrinsicGuess=True,
-            flags=cv2.SOLVEPNP_ITERATIVE,
-        )
-        if retval:
-            rvec, tvec = rvec_ref, tvec_ref
-            print(f"  [PnP] Stage 2 (ITERATIVE refine on {len(inlier_idx)} inliers): OK")
-        else:
-            print(f"  [PnP] Stage 2 refine failed, using Stage 1 result")
-
-    print(f" [PnP] rvec (rad): {rvec.ravel()}  tvec: {tvec.ravel()}")
+    print(f" [PnP] rvec: {rvec.ravel()}  tvec: {tvec.ravel()}")
 
     R_out, _ = cv2.Rodrigues(rvec)
     t_out = tvec.ravel()
@@ -388,20 +276,18 @@ def solve_pose_pnp(pts2d, pts3d, K, R_init,
     pts3d_in = pts3d[inlier_idx]
     pts2d_in = pts2d[inlier_idx]
     proj, _ = cv2.projectPoints(
-        pts3d_in.astype(np.float32), rvec, tvec,
-        K.astype(np.float64), dist
+        pts3d_in, rvec, tvec,
+        K, distCoeffs
     )
     err = np.linalg.norm(proj.reshape(-1, 2) - pts2d_in, axis=1).mean()
 
     print(f"  [PnP] Final: {len(inlier_idx)} inliers, reproj_err={err:.2f}px")
 
     return (
-        R_out.astype(np.float64),
-        t_out.astype(np.float64),
-        f"pnp_2stage_{stage1_method}",
-        len(inlier_idx),
-        float(err),
-        inlier_idx,
+        R_out,
+        t_out,
+        err,
+        inlier_idx
     )
 
 
@@ -430,23 +316,6 @@ def project_axes_overlay(img_bgr, K, R, t, axis_len_m, out_path=None):
         ensure_dir(Path(out_path).parent)
         cv2.imwrite(str(out_path), img)
     return img
-
-
-def load_ply_xyz(ply_path):
-    from plyfile import PlyData
-    ply = PlyData.read(str(ply_path))
-    v   = ply["vertex"].data
-    xyz = np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float32)
-    return xyz
-
-
-def rotation_geodesic_deg(R_a, R_b):
-    R_a = np.asarray(R_a, dtype=np.float64)
-    R_b = np.asarray(R_b, dtype=np.float64)
-    R_rel = R_a @ R_b.T
-    cos_theta = (np.trace(R_rel) - 1.0) * 0.5
-    cos_theta = np.clip(cos_theta, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cos_theta)))
 
 
 def build_same_corr_motion_trace(
@@ -1435,595 +1304,453 @@ def full_to_query_masked_coords(pts2d_full, step1_crop_offset_xy):
     return pts2d_full - off
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main entry
-# ─────────────────────────────────────────────────────────────────────────────
+def get_gallery_pose(gallery_poses, render_index):
+    pose = gallery_poses[render_index]
+    assert pose["index"] == render_index, f"Best render index mismatch: {pose['index']} vs {render_index}"
 
-def run_step6_translation(args):
-    out_dir = Path(args.out_dir)
-    ensure_dir(out_dir)
-
-    gallery_dir = Path(args.gallery_xyz_dir).parent / "gallery_renders_gs_ds"
-    npz_path = out_dir / "loftr_best_match_data.npz"
-    meta_path = out_dir / "loftr_best_match_meta.json"
-    loftr_json_path = out_dir / "loftr_scores.json"
-
-    if not npz_path.exists():
-        raise FileNotFoundError(
-            f"loftr_best_match_data.npz not found: {npz_path}\n"
-            "step4 (dino_loftr)를 먼저 실행하세요."
-        )
-
-    match_data = np.load(str(npz_path))
-    meta = load_json(meta_path)
-    loftr_json = load_json(loftr_json_path)
-
-    g_bboxes = np.load(gallery_dir / "gallery_bboxes.npy")
-
-    mkpts0_840 = match_data["mkpts0"]
-    mkpts1_840 = match_data["mkpts1"]
-    conf = match_data["conf"]
-
-    best_render = loftr_json["best_render"]
-
-    print(f"  Loaded {len(mkpts0_840)} inlier matches for '{best_render}'")
-
-    if len(mkpts0_840) == 0:
-        raise RuntimeError(
-            f"No LoFTR inlier matches for '{best_render}'. "
-            "step5(dino_loftr)의 LOFTR_CONF_THRESH를 낮추거나 "
-            "LOFTR_RANSAC_THRESH를 높여서 step5를 재실행하세요."
-        )
-
-    resize_target = int(meta["loftr_resize_target"])
-
-    q_bbox    = np.array(meta["query_nonblack_bbox_xyxy"], dtype=np.int32)
-    q_crop_hw = np.flip(q_bbox[2:] - q_bbox[:2])
-    pts_q_crop = unmap_from_square_resize(mkpts0_840, q_crop_hw, resize_target)
-    pts_q_full = to_full_image_coords(pts_q_crop, q_bbox[:2])
-
-    g_bbox = g_bboxes[int(best_render)]
-    g_crop_hw = np.flip(g_bbox[2:] - g_bbox[:2])
-    pts_g_crop = unmap_from_square_resize(mkpts1_840, g_crop_hw, resize_target)
-    pts_g_full = to_full_image_coords(pts_g_crop, g_bbox[:2])
-    
-    xyz_dir = Path(args.gallery_xyz_dir)
-    xyz_mapc_path = xyz_dir / f"{best_render}c.npy"
-    xyz_mapc = np.load(str(xyz_mapc_path)) 
-    xyz_map = np.zeros( (1080, 1920, 3), dtype=np.float32)
-    xyz_map[ g_bbox[1]:g_bbox[3], g_bbox[0]:g_bbox[2], : ] = xyz_mapc
-
-    # KSCHOI: XYZ map 검증을 위해 원본 XYZ map도 로드해서 비교해봄. xyz_map1(1920*1080), xyz_mapc(박스 영역), xyz_map(전체 이미지에 박스 영역만 채워넣은 것)
-    # xyz_map_path = xyz_dir / f"{best_render}.npy"
-    # xyz_map1 = np.load(str(xyz_map_path))
-    # assert np.array_equal(xyz_map, xyz_map1), f"XYZ map mismatch between {xyz_map_path} and {xyz_mapc_path}"
-
-    if len(pts_q_full) > 0:
-        print(f"  pts_q_full range: x=[{pts_q_full[:,0].min():.0f},{pts_q_full[:,0].max():.0f}], y=[{pts_q_full[:,1].min():.0f},{pts_q_full[:,1].max():.0f}]")
-    if len(pts_g_full) > 0:
-        print(f"  pts_g_full range: x=[{pts_g_full[:,0].min():.0f},{pts_g_full[:,0].max():.0f}], y=[{pts_g_full[:,1].min():.0f},{pts_g_full[:,1].max():.0f}]")
-    print(f"  XYZ map: {xyz_mapc_path.name}  shape={xyz_map.shape}")
+    R = np.array(pose["R_obj_to_cam"], dtype=np.float64)
+    t = np.array(pose["t_obj_to_cam"], dtype=np.float64)
+    return R, t
 
 
-    pts3d, valid_mask = lookup_xyz_at_pixels(xyz_map, pts_g_full, bilinear=True)
+def get_initial_pose(xyz_map, pts_2d_xyz, pts_2d_query, conf, K, R0, reproj_thresh):
+    ################################################
+    # Sifting 2D- and 3D-points
+    # 1. pts3d from xyz_map ; not NaN, not zero distance
+    # 2. pts3d outlier removal based on distance from camera (Median 거리의 5배 이상되는 이상치 제거)
+    # 3. Uniform sampling considering confidence scores (conf) to ensure good coverage and quality of points
 
+    assert len(pts_2d_xyz) == len(pts_2d_query) == len(conf), "Length mismatch among pts_2d_xyz, pts_2d_query, conf"
+
+    match_counts = []
+    match_counts.append( ("matched points", len(pts_2d_xyz)) )
+
+    inlier_idx = np.arange(match_counts[0][1])
+
+    # Rendered gallery의 XYZ map에서 pts_g_full의 픽셀 위치에 해당하는 3D 좌표를 가져옴
+    pts3d, valid_mask = lookup_xyz(xyz_map, pts_2d_xyz)
     n_valid = int(valid_mask.sum())
-    print(f"  Valid 2D-3D correspondences: {n_valid} / {len(pts_g_full)}")
-
+    print(f"  Valid 2D-3D correspondences: {n_valid} / {len(pts_2d_xyz)}")
     if n_valid < 4:
         raise RuntimeError(
             f"Not enough valid 2D-3D correspondences ({n_valid}). "
             "XYZ map이 비어있거나 gallery_xyz_dir 경로를 확인하세요."
         )
+    match_counts.append( ("valid (not NaN nor near cam) xyz(3D) points", n_valid) )
 
-    pts2d_corr = pts_q_full[valid_mask]
-    pts3d_corr = pts3d[valid_mask]
-    pts_g_corr = pts_g_full[valid_mask]
-    conf_corr = conf[valid_mask]
+    pts3d = pts3d[valid_mask]
+    pts2d = pts_2d_query[valid_mask]
+    conf = conf[valid_mask]
+    inlier_idx = inlier_idx[valid_mask]
 
-    print(f"  Before query-mask filtering: {len(pts2d_corr)} correspondences")
+    # 3D 점의 거리가 너무 큰 이상치 제거 (Median 거리의 5배 이상되는 이상치)
+    pts3d_norms = np.linalg.norm(pts3d, axis=1)
+    median_norm = np.median(pts3d_norms)
+    outlier_thresh = median_norm * 5.0
+    valid_mask = pts3d_norms < outlier_thresh
+    
+    pts3d = pts3d[valid_mask]
+    pts2d = pts2d[valid_mask]
+    conf  = conf[valid_mask]
+    inlier_idx = inlier_idx[valid_mask]
+    n_valid = len(inlier_idx)
+    match_counts.append( ("inlier (not too far) 3D points", n_valid) )
+    
+    if n_valid < 4:
+        raise RuntimeError(
+            f"Not enough correspondences after 3D outlier filtering: {n_valid}"
+        )
 
-    query_mask_path = getattr(args, "query_mask_path", None)
-    n_inside_query_mask = None
-
-    if query_mask_path:
-        query_mask = cv2.imread(str(query_mask_path), cv2.IMREAD_GRAYSCALE)
-        if query_mask is None:
-            raise FileNotFoundError(f"Failed to load query mask: {query_mask_path}")
-
-        inside_mask = filter_points_by_binary_mask(pts2d_corr, query_mask)
-        n_inside_query_mask = int(inside_mask.sum())
-
-        print(f"  Query-mask inside correspondences: {n_inside_query_mask} / {len(pts2d_corr)}")
-
-        pts2d_corr = pts2d_corr[inside_mask]
-        pts3d_corr = pts3d_corr[inside_mask]
-        pts_g_corr = pts_g_corr[inside_mask]
-        conf_corr = conf_corr[inside_mask]
-
-        if len(pts2d_corr) < 4:
-            raise RuntimeError(
-                f"Not enough correspondences after query-mask filtering: {len(pts2d_corr)}"
-            )
-    else:
-        print("  [WARN] --query_mask_path not provided, skipping query-mask filtering")
-
-    pts2d_before_uniform = pts2d_corr.copy()
-        
     use_uniform_sampling = True
-    uniform_keep_idx = None
-    uniform_cell_stats = None
-
     if use_uniform_sampling:
-        uniform_keep_idx, uniform_cell_stats = uniform_sample_points_2d(
-            pts2d_corr,
-            scores=conf_corr,
+        keep_idx, uniform_cell_stats = uniform_sample_points_2d(
+            pts2d,
+            scores=conf,
             grid_rows=10,
             grid_cols=10,
             max_per_cell=60,
         )
 
-        print(f"  Uniform sampling: {len(uniform_keep_idx)} / {len(pts2d_corr)} kept")
+        print(f"  Uniform sampling: {len(keep_idx)} / {n_valid} kept")
         print(f"  Uniform cell stats: {uniform_cell_stats}")
 
-        pts2d_corr = pts2d_corr[uniform_keep_idx]
-        pts3d_corr = pts3d_corr[uniform_keep_idx]
-        conf_corr  = conf_corr[uniform_keep_idx]
-        pts_g_corr = pts_g_corr[uniform_keep_idx]
+        pts2d = pts2d[keep_idx]
+        pts3d = pts3d[keep_idx]
+        conf  = conf[keep_idx]
+        inlier_idx = inlier_idx[keep_idx]
+        n_valid = len(inlier_idx)
+        match_counts.append( ("uniformly sampled points", n_valid) )
 
-        if len(pts2d_corr) < 4:
+        if n_valid < 4:
             raise RuntimeError(
-                f"Not enough correspondences after uniform sampling: {len(pts2d_corr)}"
+                f"Not enough correspondences after uniform sampling: {n_valid}"
             )
     else:
         print("  Uniform sampling disabled")
 
-    _norms = np.linalg.norm(pts3d_corr, axis=1)
-    _median_norm = np.median(_norms)
-    _outlier_thresh = _median_norm * 5.0
-    _outlier_mask = _norms < _outlier_thresh
-    n_before_outlier = len(pts3d_corr)
-    pts2d_corr = pts2d_corr[_outlier_mask]
-    pts3d_corr = pts3d_corr[_outlier_mask]
-    conf_corr  = conf_corr[_outlier_mask]
-    pts_g_corr = pts_g_corr[_outlier_mask]
-    print(f"  3D outlier filter (norm < {_outlier_thresh:.4f} = 5*median): "
-          f"{len(pts3d_corr)} / {n_before_outlier} kept")
+    R, t, reproj_err, pnp_inlier_idx = solve_pose_pnp(
+        pts2d, pts3d,
+        K, R0,
+        reproj_thresh       
+    )
 
-    if len(pts2d_corr) < 4:
-        raise RuntimeError(
-            f"Not enough correspondences after 3D outlier filtering: {len(pts2d_corr)}"
-        )
+    match_counts.append( ("inliers after PnP reprojection error filtering", len(pnp_inlier_idx)) )
 
-    gallery = load_json(args.gallery_pose_json)
-    render_idx = int(Path(best_render).stem)
-    pose_record = None
-    for pose in gallery["poses"]:
-        if int(pose["index"]) == render_idx:
-            pose_record = pose
-            break
-    if pose_record is None:
-        raise KeyError(f"Pose for render '{best_render}' not found in gallery_poses.json")
+    return R, t, pts3d, reproj_err, inlier_idx[pnp_inlier_idx], match_counts
 
-    R_gallery = np.array(pose_record["R_obj_to_cam"], dtype=np.float64)
-    t_gallery = np.array(pose_record["t_obj_to_cam"], dtype=np.float64)
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry
+# ─────────────────────────────────────────────────────────────────────────────
 
+def run_step6_translation(args):
+    # 다양한 중간 산출물 저장 공간
+    out_dir = Path(args.out_dir)
+    ensure_dir(out_dir)
+
+    # Camera intrinsics
     K = load_intrinsics(args.intrinsics_path)
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
 
     print(f"  K: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
 
-    reproj_thresh = float(getattr(args, "pnp_reproj_error", 200.0))
+    # best gallery index
+    loftr_json_path = out_dir / "loftr_scores.json"
+    loftr_json = load_json(loftr_json_path)
+    best_render = int(loftr_json["best_render"])
 
-    print(f"  pts2d_corr are already in full-image coordinates: shape={pts2d_corr.shape}")
+    # bounding boxes for gallery renders
+    gallery_dir = Path(args.gallery_xyz_dir).parent / "gallery_renders_gs_ds"
+    g_bboxes = np.load(gallery_dir / "gallery_bboxes.npy")
 
-    query_img = load_image(args.query_img)
+    g_bbox = g_bboxes[best_render]
+
+    # best render의 pose 정보 (R, t) 가져오기
+    gallery = load_json(args.gallery_pose_json)
+    R0, t0 = get_gallery_pose(gallery["poses"], best_render)
     
-    render_width = int(getattr(args, "render_width", query_img.shape[1]))
-    render_height = int(getattr(args, "render_height", query_img.shape[0]))
-    gs_model_dir = getattr(args, "gs_model_dir", None)
-    gs_iter = getattr(args, "gs_iter", None)
-    gs_repo = getattr(args, "gs_repo", None)
-    gs_python = getattr(args, "gs_python", None) or sys.executable
-    bg_color = getattr(args, "bg_color", "0,0,0")
-    gs_mode = getattr(args, "gs_mode", "2dgs")
+    # reprojection error threshold for PnP in pixels (step5에서 이보다 작은 reprojection error를 가진 점들을 inlier로 간주)
+    reproj_thresh = float(getattr(args, "pnp_reproj_error", 10.0))
 
-    query_masked_img = None
-    if getattr(args, "query_masked_path", None):
-        qmp = Path(args.query_masked_path)
-        if qmp.exists():
-            query_masked_img = load_image(qmp)
-        else:
-            print(f"  [WARN] query_masked_path not found: {qmp}")
+    # matching information
+    npz_path = out_dir / "loftr_best_match_data.npz"
+    if not npz_path.exists():
+        raise FileNotFoundError(
+            f"loftr_best_match_data.npz not found: {npz_path}\n step 5 PnP를 먼저 실행하세요."
+        )
+    
+    match_data = np.load(str(npz_path))
+    pts_q_full = match_data["mkpts0"]
+    pts_g_full = match_data["mkpts1"]
+    conf = match_data["conf"]
 
-    no_pnp = bool(getattr(args, "no_pnp", False))
+    print(f"  Loaded {len(pts_q_full)} inlier matches for '{best_render}'")
+    assert len(pts_q_full) > 0
+    
+    # construct the corresponding XYZ map 
+    xyz_dir = Path(args.gallery_xyz_dir)
+    
+    cropped_xyz_maps = []
+    for idx in tqdm(range(len(g_bboxes)), desc="Loading xyz crops"):
+        xyz_dir = Path(args.gallery_xyz_dir)
+        xyz_mapc_path = xyz_dir / f"{idx:04d}c.npy"
+        cropped_xyz_maps.append(np.load(str(xyz_mapc_path)).astype(np.float64) )
 
-    if no_pnp:
-        R_out = R_gallery.copy()
-        inlier_idx = np.arange(len(pts2d_corr), dtype=np.int32)
-        reproj_err = np.inf
+    # Get initial pose using the matched 2D-3D correspondences and PnP
+    xyz_map = cropped_xyz_maps[best_render]
+    pts2d_xyz = pts_g_full - [g_bbox[:2]]
+    
+    R, t, pts3d, reproj_err, inlier_idx, match_counts = get_initial_pose(
+        xyz_map, pts2d_xyz, pts_q_full, conf, 
+        K, R0, reproj_thresh
+    )
+    quat = rotation_matrix_to_quaternion(R)
+
+    n_valid = match_counts[-1][1]
+    assert n_valid == len(inlier_idx), "Length mismatch after get_initial_pose"
+    
+    # if not _gallery_render_path.exists():
+    #     _gallery_render_path = xyz_dir.parent / "gallery_renders" / best_render
+    
+    # _save_correspondence_debug(
+    #     out_dir=out_dir,
+    #     query_img=query_img,
+    #     gallery_render_path=_gallery_render_path,
+    #     pts2d_query=pts2d_corr,
+    #     pts3d_obj=pts3d_corr,
+    #     pts2d_gallery=pts_g_corr,
+    #     R=R_out, t=t_out, K=K,
+    #     inlier_idx=inlier_idx,
+    # )
+
+    # xyz_refine_info = {"status": "not_run"}
+    # skip_t_refine    = bool(getattr(args, "skip_t_refine", False))
+
+    # if skip_t_refine:
+    #     print("  [xyz refine] skipped (--skip_t_refine)")
+    #     xyz_refine_info["status"] = "skipped_by_flag"
+    # else: 
+    #     t_pnp = t_out.copy()
+    #     iou_accept_thresh = float(getattr(args, "t_refine_iou_thresh", 0.30))
+
+    #     query_img = load_bgr(args.query_img)
+    #     query_masked_img = None
+    #     if getattr(args, "query_masked_path", None):
+    #         qmp = Path(args.query_masked_path)
+    #         if qmp.exists():
+    #             query_masked_img = load_bgr(qmp)
+    #         else:
+    #             print(f"  [WARN] query_masked_path not found: {qmp}")
+    
+    #     render_width = int(getattr(args, "render_width", query_img.shape[1]))
+    #     render_height = int(getattr(args, "render_height", query_img.shape[0]))
+    #     gs_model_dir = getattr(args, "gs_model_dir", None)
+    #     gs_iter = getattr(args, "gs_iter", None)
+    #     gs_repo = getattr(args, "gs_repo", None)
+    #     gs_python = getattr(args, "gs_python", None) or sys.executable
+    #     bg_color = getattr(args, "bg_color", "0,0,0")
+    #     gs_mode = getattr(args, "gs_mode", "2dgs")
         
-        object_height_m_init = float(getattr(args, "object_height_m", 0.125))
-        _qmask_init = make_query_reference_mask(
-            query_masked_img=query_masked_img,
-            query_mask_path=(out_dir / "query_mask.png"),
-            nonblack_thresh=8,
-        )
-        if _qmask_init is not None:
-            tz_init = estimate_tz_from_mask_bbox(_qmask_init, fy=fy, object_height_m=object_height_m_init)
-            q_stats_init = binary_mask_bbox_stats(_qmask_init)
-            if tz_init is not None and q_stats_init is not None:
-                tx_init = (q_stats_init["cx"] - cx) / fx * tz_init
-                ty_init = (q_stats_init["cy"] - cy) / fy * tz_init
-                t_out = np.array([tx_init, ty_init, tz_init], dtype=np.float64)
-                print(f"  [no_pnp] bbox-based t_init: [{tx_init:.4f}, {ty_init:.4f}, {tz_init:.4f}]")
-            else:
-                t_out = t_gallery.copy()
-                print(f"  [no_pnp] mask bbox estimation failed -> using gallery t")
-        else:
-            t_out = t_gallery.copy()
-            print(f"  [no_pnp] no mask -> using gallery t")
+    #     if gs_model_dir and gs_iter is not None and gs_repo and gs_python:
+    #         query_ref_mask = make_query_reference_mask(
+    #             query_masked_img=query_masked_img,
+    #             query_mask_path=(out_dir / "query_mask.png"),
+    #             nonblack_thresh=8,
+    #         )
 
-        print(f"  [no_pnp] R = R_gallery, t = bbox_prior  (PnP skipped)")
-    else:
-        R_out, t_out, pose_method, inlier_count, reproj_err, inlier_idx = solve_pose_pnp(
-            pts2d_corr,
-            pts3d_corr,
-            K,
-            R_init=R_gallery,
-            reproj_thresh=reproj_thresh,
-            use_ransac=not bool(getattr(args, "no_pnp_ransac", False)),
-        )
+    #         object_height_m = float(getattr(args, "object_height_m", 0.125))
 
-    _gallery_render_path = xyz_dir.parent / "gallery_renders_gs_ds" / best_render
-    if not _gallery_render_path.exists():
-        _gallery_render_path = xyz_dir.parent / "gallery_renders" / best_render
-    _save_correspondence_debug(
-        out_dir=out_dir,
-        query_img=query_img,
-        gallery_render_path=_gallery_render_path,
-        pts2d_query=pts2d_corr,
-        pts3d_obj=pts3d_corr,
-        pts2d_gallery=pts_g_corr,
-        R=R_out, t=t_out, K=K,
-        inlier_idx=inlier_idx,
-    )
+    #         if query_ref_mask is not None:
+    #             tz_bbox = estimate_tz_from_mask_bbox(
+    #                 query_ref_mask,
+    #                 fy=K[1, 1],
+    #                 object_height_m=object_height_m,
+    #             )
 
-    xyz_refine_info = {"status": "not_run"}
-    skip_t_refine    = bool(getattr(args, "skip_t_refine", False))
-    iou_accept_thresh = float(getattr(args, "t_refine_iou_thresh", 0.30))
+    #             if tz_bbox is not None:
+    #                 rel_err = abs(float(t_out[2]) - float(tz_bbox)) / max(float(tz_bbox), 1e-8)
+    #                 print(f"  [tz prior] bbox-based tz={tz_bbox:.4f} m, "
+    #                     f"PnP tz={float(t_out[2]):.4f} m, rel_err={rel_err * 100.0:.1f}%")
 
-    t_pnp = t_out.copy()
+    #             t_refined, xyz_refine_info = refine_translation_xyz_with_mask(
+    #                 R=R_out,
+    #                 t_init=t_out,
+    #                 K=K,
+    #                 width=render_width,
+    #                 height=render_height,
+    #                 query_mask_img=query_ref_mask,
+    #                 object_height_m=object_height_m,
+    #                 gs_python=gs_python,
+    #                 gs_repo=gs_repo,
+    #                 gs_model_dir=gs_model_dir,
+    #                 gs_iter=gs_iter,
+    #                 intrinsics_path=args.intrinsics_path,
+    #                 bg_color=bg_color,
+    #                 nonblack_thresh=8,
+    #                 prior_range=(0.80, 1.20),
+    #                 num_iters=4,
+    #                 alpha_xy=0.65,
+    #                 alpha_z=0.55,
+    #             )
 
-    if skip_t_refine:
-        print("  [xyz refine] skipped (--skip_t_refine)")
-        xyz_refine_info["status"] = "skipped_by_flag"
+    #             best_score = xyz_refine_info.get("best_score") or -1.0
+    #             best_iou   = (xyz_refine_info.get("best_metrics") or {}).get("iou", 0.0)
+    #             t_ref      = np.asarray(xyz_refine_info["t_refined"], dtype=np.float64)
 
-    elif gs_model_dir and gs_iter is not None and gs_repo and gs_python:
-        query_ref_mask = make_query_reference_mask(
-            query_masked_img=query_masked_img,
-            query_mask_path=(out_dir / "query_mask.png"),
-            nonblack_thresh=8,
-        )
+    #             print(f"  [xyz refine] status={xyz_refine_info['status']}, "
+    #                 f"best_score={best_score:.4f}, best_iou={best_iou:.4f} "
+    #                 f"(threshold={iou_accept_thresh:.2f})")
+    #             print(f"  [xyz refine] t_pnp=[{t_pnp[0]:.4f}, {t_pnp[1]:.4f}, {t_pnp[2]:.4f}]")
+    #             print(f"  [xyz refine] t_ref=[{t_ref[0]:.4f}, {t_ref[1]:.4f}, {t_ref[2]:.4f}]")
 
-        object_height_m = float(getattr(args, "object_height_m", 0.125))
+    #             if best_iou >= iou_accept_thresh:
+    #                 t_out = t_refined
+    #                 xyz_refine_info["t_applied"] = True
+    #                 print(f"  [xyz refine] IoU={best_iou:.4f} >= {iou_accept_thresh:.2f} -> t_refined applied")
+    #             else:
+    #                 t_out = t_pnp
+    #                 xyz_refine_info["t_applied"] = False
+    #                 print(f"  [xyz refine] IoU={best_iou:.4f} < {iou_accept_thresh:.2f} -> PnP t kept")
+    #         else:
+    #             print("  [xyz refine] query reference mask unavailable, skipping.")
+    #             xyz_refine_info["status"] = "skipped_no_query_mask"
+    #     else:
+    #         print("  [xyz refine] GS render args missing, skipping.")
+    #         xyz_refine_info["status"] = "skipped_no_gs_args"
 
-        if query_ref_mask is not None:
-            tz_bbox = estimate_tz_from_mask_bbox(
-                query_ref_mask,
-                fy=K[1, 1],
-                object_height_m=object_height_m,
-            )
-
-            if tz_bbox is not None:
-                rel_err = abs(float(t_out[2]) - float(tz_bbox)) / max(float(tz_bbox), 1e-8)
-                print(f"  [tz prior] bbox-based tz={tz_bbox:.4f} m, "
-                      f"PnP tz={float(t_out[2]):.4f} m, rel_err={rel_err * 100.0:.1f}%")
-
-            t_refined, xyz_refine_info = refine_translation_xyz_with_mask(
-                R=R_out,
-                t_init=t_out,
-                K=K,
-                width=render_width,
-                height=render_height,
-                query_mask_img=query_ref_mask,
-                object_height_m=object_height_m,
-                gs_python=gs_python,
-                gs_repo=gs_repo,
-                gs_model_dir=gs_model_dir,
-                gs_iter=gs_iter,
-                intrinsics_path=args.intrinsics_path,
-                bg_color=bg_color,
-                nonblack_thresh=8,
-                prior_range=(0.80, 1.20),
-                num_iters=4,
-                alpha_xy=0.65,
-                alpha_z=0.55,
-            )
-
-            best_score = xyz_refine_info.get("best_score") or -1.0
-            best_iou   = (xyz_refine_info.get("best_metrics") or {}).get("iou", 0.0)
-            t_ref      = np.asarray(xyz_refine_info["t_refined"], dtype=np.float64)
-
-            print(f"  [xyz refine] status={xyz_refine_info['status']}, "
-                  f"best_score={best_score:.4f}, best_iou={best_iou:.4f} "
-                  f"(threshold={iou_accept_thresh:.2f})")
-            print(f"  [xyz refine] t_pnp=[{t_pnp[0]:.4f}, {t_pnp[1]:.4f}, {t_pnp[2]:.4f}]")
-            print(f"  [xyz refine] t_ref=[{t_ref[0]:.4f}, {t_ref[1]:.4f}, {t_ref[2]:.4f}]")
-
-            if best_iou >= iou_accept_thresh:
-                t_out = t_refined
-                xyz_refine_info["t_applied"] = True
-                print(f"  [xyz refine] IoU={best_iou:.4f} >= {iou_accept_thresh:.2f} -> t_refined applied")
-            else:
-                t_out = t_pnp
-                xyz_refine_info["t_applied"] = False
-                print(f"  [xyz refine] IoU={best_iou:.4f} < {iou_accept_thresh:.2f} -> PnP t kept")
-        else:
-            print("  [xyz refine] query reference mask unavailable, skipping.")
-            xyz_refine_info["status"] = "skipped_no_query_mask"
-    else:
-        print("  [xyz refine] GS render args missing, skipping.")
-        xyz_refine_info["status"] = "skipped_no_gs_args"
-
-    q_out = rotation_matrix_to_quaternion(R_out)
-
-    if len(inlier_idx) > 0:
-        pts2d_inliers = pts2d_corr[inlier_idx]
-        pts3d_inliers = pts3d_corr[inlier_idx]
-    else:
-        pts2d_inliers = np.empty((0, 2), dtype=np.float64)
-        pts3d_inliers = np.empty((0, 3), dtype=np.float64)
-
-    t_before_vis = estimate_t_linear(pts2d_corr, pts3d_corr, K, R_gallery)
-
-    stats_after_all = compute_mean_reprojection_error(
-        pts2d=pts2d_corr,
-        pts3d=pts3d_corr,
-        K=K,
-        R=R_out,
-        t=t_out,
-    )
-    print(f"  [All Corr] after  mean={stats_after_all['mean_px']:.2f}px, "
-        f"median={stats_after_all['median_px']:.2f}px, max={stats_after_all['max_px']:.2f}px")
-
-    if len(pts2d_inliers) > 0:
-        stats_after_inliers = compute_mean_reprojection_error(
-            pts2d=pts2d_inliers,
-            pts3d=pts3d_inliers,
-            K=K,
-            R=R_out,
-            t=t_out,
-        )
-        print(f"  [Inliers Only] after mean={stats_after_inliers['mean_px']:.2f}px, "
-            f"median={stats_after_inliers['median_px']:.2f}px, max={stats_after_inliers['max_px']:.2f}px")
-    else:
-        stats_after_inliers = {
-            "mean_px": None,
-            "median_px": None,
-            "max_px": None,
-            "num_points": 0,
-        }
-
-    reproj_stats_after_all = compute_mean_reprojection_error(
-        pts2d_corr, pts3d_corr, K, R_out, t_out
-    )
-
+    # assert len(inlier_idx) > 0, "No inlier points found"
+    
+    pts2d = pts_q_full[inlier_idx]
+    pts3d = pts3d[inlier_idx]
     reproj_stats_after_inliers = compute_mean_reprojection_error(
-        pts2d_inliers, pts3d_inliers, K, R_out, t_out
+        pts2d, pts3d, K, R, t
     )
-
-    print(f"  [Reproj after PnP / all]    mean={reproj_stats_after_all['mean_px']:.2f}px, "
-        f"median={reproj_stats_after_all['median_px']:.2f}px, "
-        f"max={reproj_stats_after_all['max_px']:.2f}px, "
-        f"N={reproj_stats_after_all['num_points']}")
 
     print(f"  [Reproj after PnP / inlier] mean={reproj_stats_after_inliers['mean_px']:.2f}px, "
         f"median={reproj_stats_after_inliers['median_px']:.2f}px, "
         f"max={reproj_stats_after_inliers['max_px']:.2f}px, "
         f"N={reproj_stats_after_inliers['num_points']}")
 
-    reproj_debug_path = out_dir / "step6_reproj_debug_inliers.png"
-    reproj_debug_stats_path = out_dir / "step6_reproj_debug_inliers_stats.json"
 
-    if len(pts2d_inliers) > 0:
-        N_in = min(len(pts2d_inliers), 120)
-        rng_in = np.random.default_rng(42)
-        dbg_idx_in = rng_in.choice(len(pts2d_inliers), size=N_in, replace=False)
+    # reproj_debug_path = out_dir / "step6_reproj_debug_inliers.png"
+    # reproj_debug_stats_path = out_dir / "step6_reproj_debug_inliers_stats.json"
 
-        draw_correspondence_debug_single_pose(
-            query_img=query_img,
-            pts2d_query=pts2d_inliers,
-            pts3d_obj=pts3d_inliers,
-            K=K,
-            R=R_out,
-            t=t_out,
-            out_path=reproj_debug_path,
-            draw_idx=dbg_idx_in,
-            title_prefix="PnP inliers only (after pose)",
-            stats_json_path=reproj_debug_stats_path,
-        )
-    else:
-        cv2.imwrite(str(reproj_debug_path), query_img.copy())
-        save_json(reproj_debug_stats_path, {
-            "title_prefix": "PnP inliers only (after pose)",
-            "num_points_total": 0,
-            "num_points_drawn": 0,
-        })
+    
 
-    post_gs_render_path = None
-    post_gs_overlay_path = None
-    post_gs_xyz_path = None
+    # draw_correspondence_debug_single_pose(
+    #     query_img=query_img,
+    #     pts2d_query=pts2d,
+    #     pts3d_obj=pts3d,
+    #     K=K,
+    #     R=R,
+    #     t=t,
+    #     out_path=reproj_debug_path,
+    #     draw_idx=np.random.default_rng(42).rng_in.choice(n_valid, size=min(n_valid, 120), replace=False),
+    #     title_prefix="PnP inliers only (after pose)",
+    #     stats_json_path=reproj_debug_stats_path,
+    # )
 
-    if gs_model_dir and gs_iter is not None and gs_repo and gs_python:
-        post_pose_json = out_dir / "step6_pose_after_pnp.json"
-        post_gs_render_path = out_dir / "step6_gs_render_after_pnp.png"
-        post_gs_overlay_path = out_dir / "step6_gs_render_overlay_after_pnp.png"
-        post_gs_xyz_path = out_dir / "step6_gs_render_after_pnp_xyz.npy"
+    # post_gs_render_path = None
+    # post_gs_overlay_path = None
+    # post_gs_xyz_path = None
 
-        save_camera_pose_json(
-            post_pose_json,
-            K=K,
-            R=R_out,
-            t=t_out,
-            width=render_width,
-            height=render_height,
-        )
+    # if gs_model_dir and gs_iter is not None and gs_repo and gs_python:
+    #     post_pose_json = out_dir / "step6_pose_after_pnp.json"
+    #     post_gs_render_path = out_dir / "step6_gs_render_after_pnp.png"
+    #     post_gs_overlay_path = out_dir / "step6_gs_render_overlay_after_pnp.png"
+    #     post_gs_xyz_path = out_dir / "step6_gs_render_after_pnp_xyz.npy"
 
-        try:
-            render_single_pose_gs(
-                gs_python=gs_python,
-                gs_repo=gs_repo,
-                gs_model_dir=gs_model_dir,
-                gs_iter=gs_iter,
-                intrinsics_path=args.intrinsics_path,
-                pose_json_path=post_pose_json,
-                output_png_path=post_gs_render_path,
-                width=render_width,
-                height=render_height,
-                bg_color=bg_color,
-                gs_mode=gs_mode,
-                save_xyz=True,
-                xyz_output_path=post_gs_xyz_path,
-            )
-            post_render_img = load_image(post_gs_render_path)
-            overlay_render_on_query(
-                query_img=query_img,
-                render_img=post_render_img,
-                out_path=post_gs_overlay_path,
-                alpha=0.45,
-                nonblack_thresh=8,
-            )
-        except Exception as e:
-            print(f"  [WARN] Failed to render GS after PnP: {e}")
-            post_gs_render_path = None
-            post_gs_overlay_path = None
-            post_gs_xyz_path = None
-    else:
-        print("  [WARN] GS render args missing for after-PnP render overlay")
+    #     save_camera_pose_json(
+    #         post_pose_json,
+    #         K=K,
+    #         R=R_out,
+    #         t=t_out,
+    #         width=render_width,
+    #         height=render_height,
+    #     )
 
-    bad_inlier_local_idx = np.array([], dtype=np.int32)
-    bad_corr_global_idx = np.array([], dtype=np.int32)
+    #     try:
+    #         render_single_pose_gs(
+    #             gs_python=gs_python,
+    #             gs_repo=gs_repo,
+    #             gs_model_dir=gs_model_dir,
+    #             gs_iter=gs_iter,
+    #             intrinsics_path=args.intrinsics_path,
+    #             pose_json_path=post_pose_json,
+    #             output_png_path=post_gs_render_path,
+    #             width=render_width,
+    #             height=render_height,
+    #             bg_color=bg_color,
+    #             gs_mode=gs_mode,
+    #             save_xyz=True,
+    #             xyz_output_path=post_gs_xyz_path,
+    #         )
+    #         post_render_img = load_image(post_gs_render_path)
+    #         overlay_render_on_query(
+    #             query_img=query_img,
+    #             render_img=post_render_img,
+    #             out_path=post_gs_overlay_path,
+    #             alpha=0.45,
+    #             nonblack_thresh=8,
+    #         )
+    #     except Exception as e:
+    #         print(f"  [WARN] Failed to render GS after PnP: {e}")
+    #         post_gs_render_path = None
+    #         post_gs_overlay_path = None
+    #         post_gs_xyz_path = None
+    # else:
+    #     print("  [WARN] GS render args missing for after-PnP render overlay")
 
-    if len(pts2d_inliers) > 0 and post_gs_render_path is not None and Path(post_gs_render_path).exists():
-        post_render_img = load_image(post_gs_render_path)
+    # bad_inlier_local_idx = np.array([], dtype=np.int32)
+    # bad_corr_global_idx = np.array([], dtype=np.int32)
 
-        bad_inlier_local_idx, proj_after_all_inliers = get_outside_after_inlier_indices(
-            pts3d_inliers=pts3d_inliers,
-            K=K,
-            R_after=R_out,
-            t_after=t_out,
-            render_img_after=post_render_img,
-            nonblack_thresh=8,
-        )
+    # if len(pts2d_inliers) > 0 and post_gs_render_path is not None and Path(post_gs_render_path).exists():
+    #     post_render_img = load_image(post_gs_render_path)
 
-        if len(bad_inlier_local_idx) > 0:
-            bad_corr_global_idx = inlier_idx[bad_inlier_local_idx].astype(np.int32)
+    #     bad_inlier_local_idx, proj_after_all_inliers = get_outside_after_inlier_indices(
+    #         pts3d_inliers=pts3d_inliers,
+    #         K=K,
+    #         R_after=R_out,
+    #         t_after=t_out,
+    #         render_img_after=post_render_img,
+    #         nonblack_thresh=8,
+    #     )
 
-        print(f"  [Prune candidates] outside-after-render inliers: {len(bad_inlier_local_idx)}")
+    #     if len(bad_inlier_local_idx) > 0:
+    #         bad_corr_global_idx = inlier_idx[bad_inlier_local_idx].astype(np.int32)
 
-        save_json(out_dir / "step6_bad_after_render_inliers.json", {
-            "bad_inlier_local_idx": bad_inlier_local_idx.tolist(),
-            "bad_corr_global_idx": bad_corr_global_idx.tolist(),
-            "num_bad_after_render": int(len(bad_inlier_local_idx)),
-        })
-    else:
-        print("  [Prune candidates] skipped (no inliers or no post render)")
+    #     print(f"  [Prune candidates] outside-after-render inliers: {len(bad_inlier_local_idx)}")
 
-    if len(bad_corr_global_idx) > 0:
-        keep_corr_mask = np.ones(len(pts2d_corr), dtype=bool)
-        keep_corr_mask[bad_corr_global_idx] = False
+    #     save_json(out_dir / "step6_bad_after_render_inliers.json", {
+    #         "bad_inlier_local_idx": bad_inlier_local_idx.tolist(),
+    #         "bad_corr_global_idx": bad_corr_global_idx.tolist(),
+    #         "num_bad_after_render": int(len(bad_inlier_local_idx)),
+    #     })
+    # else:
+    #     print("  [Prune candidates] skipped (no inliers or no post render)")
 
-        pts2d_corr_pruned = pts2d_corr[keep_corr_mask]
-        pts3d_corr_pruned = pts3d_corr[keep_corr_mask]
+    # if len(bad_corr_global_idx) > 0:
+    #     keep_corr_mask = np.ones(len(pts2d_corr), dtype=bool)
+    #     keep_corr_mask[bad_corr_global_idx] = False
 
-        keep_inlier_mask = np.ones(len(pts2d_inliers), dtype=bool)
-        keep_inlier_mask[bad_inlier_local_idx] = False
+    #     keep_inlier_mask = np.ones(len(pts2d_inliers), dtype=bool)
+    #     keep_inlier_mask[bad_inlier_local_idx] = False
 
-        pts2d_inliers_pruned = pts2d_inliers[keep_inlier_mask]
-        pts3d_inliers_pruned = pts3d_inliers[keep_inlier_mask]
-    else:
-        pts2d_corr_pruned = pts2d_corr.copy()
-        pts3d_corr_pruned = pts3d_corr.copy()
-        pts2d_inliers_pruned = pts2d_inliers.copy()
-        pts3d_inliers_pruned = pts3d_inliers.copy()
+    # try:
+    #     if post_gs_xyz_path is not None and Path(post_gs_xyz_path).exists():
+    #         post_xyz_map_samecorr = np.load(str(post_gs_xyz_path)).astype(np.float64)
 
-    try:
-        if post_gs_xyz_path is not None and Path(post_gs_xyz_path).exists():
-            post_xyz_map_samecorr = np.load(str(post_gs_xyz_path)).astype(np.float64)
+    #         same_corr_trace = build_same_corr_motion_trace(
+    #             pts2d_query_obs=pts2d_corr,
+    #             pts2d_gallery_obs=pts_g_corr,
+    #             pts3d_obj=pts3d_corr,
+    #             K=K,
+    #             R_before=R_gallery,
+    #             t_before=t_gallery,
+    #             R_after=R_out,
+    #             t_after=t_out,
+    #         )
 
-            same_corr_trace = build_same_corr_motion_trace(
-                pts2d_query_obs=pts2d_corr,
-                pts2d_gallery_obs=pts_g_corr,
-                pts3d_obj=pts3d_corr,
-                K=K,
-                R_before=R_gallery,
-                t_before=t_gallery,
-                R_after=R_out,
-                t_after=t_out,
-            )
+    #         same_corr_surface_trace = augment_same_corr_trace_with_postrender_surface(
+    #             trace=same_corr_trace,
+    #             post_xyz_map=post_xyz_map_samecorr,
+    #             xyz_err_bad_thresh_m=0.005,
+    #         )
 
-            same_corr_surface_trace = augment_same_corr_trace_with_postrender_surface(
-                trace=same_corr_trace,
-                post_xyz_map=post_xyz_map_samecorr,
-                xyz_err_bad_thresh_m=0.005,
-            )
+    #         save_json(out_dir / "step6_same_corr_postrender_surface_trace.json", same_corr_surface_trace)
+    #         save_same_corr_surface_csv(out_dir / "step6_same_corr_postrender_surface_trace.csv", same_corr_surface_trace)
 
-            save_json(out_dir / "step6_same_corr_postrender_surface_trace.json", same_corr_surface_trace)
-            save_same_corr_surface_csv(out_dir / "step6_same_corr_postrender_surface_trace.csv", same_corr_surface_trace)
-
-            ss = same_corr_surface_trace["summary"]
-            print(
-                f"  [Same corr post-render surface] "
-                f"valid={ss['num_post_xyz_valid']}/{same_corr_surface_trace['num_points']}  "
-                f"bad={ss['num_surface_bad']}  "
-                f"mean_surface_err={None if ss['mean_surface_err_m'] is None else ss['mean_surface_err_m']*1000:.2f}mm"
-            )
-            print("  [Same corr post-render surface] saved: step6_same_corr_postrender_surface_trace.json/csv")
-        else:
-            print("  [Same corr post-render surface] skipped (post XYZ unavailable)")
-    except Exception as e:
-        print(f"  [Same corr post-render surface] failed: {e}")
+    #         ss = same_corr_surface_trace["summary"]
+    #         print(
+    #             f"  [Same corr post-render surface] "
+    #             f"valid={ss['num_post_xyz_valid']}/{same_corr_surface_trace['num_points']}  "
+    #             f"bad={ss['num_surface_bad']}  "
+    #             f"mean_surface_err={None if ss['mean_surface_err_m'] is None else ss['mean_surface_err_m']*1000:.2f}mm"
+    #         )
+    #         print("  [Same corr post-render surface] saved: step6_same_corr_postrender_surface_trace.json/csv")
+    #     else:
+    #         print("  [Same corr post-render surface] skipped (post XYZ unavailable)")
+    # except Exception as e:
+    #     print(f"  [Same corr post-render surface] failed: {e}")
 
     pose_out = {
         "stage": "step6",
+        "R_obj_to_cam": R.tolist(),
+        "t_obj_to_cam": t.tolist(),
+        "quat_wxyz": quat.tolist(),
         "best_render": best_render,
-        "n_loftr_inliers_input": int(len(mkpts0_840)),
-        "n_valid_2d3d_corr": n_valid,
-        "pnp_reproj_error_px": reproj_err if np.isfinite(reproj_err) else None,
-        "gallery_pose_source": args.gallery_pose_json,
-        "xyz_map_used": str(xyz_mapc_path),
-        "R_gallery_init": R_gallery.tolist(),
-        "R_obj_to_cam": R_out.tolist(),
-        "t_obj_to_cam": t_out.tolist(),
-        "quat_wxyz": q_out.tolist(),
-        "intrinsics_path": str(args.intrinsics_path),
-        "query_mask_path": str(query_mask_path) if query_mask_path else None,
-        "n_after_query_mask_filter": int(len(pts2d_corr)),
-        "n_inside_query_mask": n_inside_query_mask,
-        "debug_reproj_inliers": str(reproj_debug_path),
-        "debug_gs_render_after_pnp": str(post_gs_render_path) if post_gs_render_path else None,
-        "debug_gs_render_overlay_after_pnp": str(post_gs_overlay_path) if post_gs_overlay_path else None,
-        "n_before_uniform_sampling": int(len(pts2d_before_uniform)),
-        "n_after_uniform_sampling": int(len(pts2d_corr)),
-        "uniform_sampling_cell_stats": uniform_cell_stats,
-        "outputs": {},
+        "pnp_reproj_error_px": reproj_err,
+        "pnp_inlier_count": n_valid,
+        "R_gallery_init": R0.tolist()
     }
 
-    pose_out["query_img"] = str(args.query_img)
-    pose_out["query_masked_path"] = str(getattr(args, "query_masked_path", ""))
-    pose_out["intrinsics_path"] = str(args.intrinsics_path)
-
     save_json(out_dir / "step6_pose.json", pose_out)
-    save_json(out_dir / "initial_pose.json", pose_out)
-
+    
     print("=" * 60)
     print("[Step 6] PnP translation estimation complete")
     print(f"  best_render     : {best_render}")
     print(f"  n_corr          : {n_valid}")
     print(f"  reproj_err      : {reproj_err:.2f}px" if np.isfinite(reproj_err) else "  reproj_err      : N/A")
-    print(f"  R_obj_to_cam    :\n{R_out}")
-    print(f"  t_obj_to_cam    : [{t_out[0]:.4f}, {t_out[1]:.4f}, {t_out[2]:.4f}]")
-    print(f"  initial_pose.json: {out_dir / 'initial_pose.json'}")
+    print(f"  R_obj_to_cam    :\n{R}")
+    print(f"  t_obj_to_cam    : [{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}]")
     print("=" * 60)

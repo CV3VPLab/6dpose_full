@@ -7,9 +7,10 @@ import numpy as np
 import torch
 import kornia.feature as KF
 
+from utils.image_utils import load_bgr
+
 from modules_6d.retrieval_dino import (
     ensure_dir,
-    load_bgr,
     tight_crop_nonblack,
     square_pad_resize,
     save_json,
