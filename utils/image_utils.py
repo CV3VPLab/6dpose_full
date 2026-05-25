@@ -131,3 +131,10 @@ def load_rgb(path):
     if img is None:
         raise FileNotFoundError(f"Failed to load image: {path}")
     return img
+
+
+def load_bgr(path):
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR_BGR)
+    if img is None:
+        raise FileNotFoundError(f"Failed to load image: {path}")
+    return img

@@ -24,6 +24,7 @@ from utils.image_utils import (
     get_max_bbox_size,
     square_bbox,
     square_pad_resize,
+    zeropad_square,
     load_rgb
 )
 
@@ -389,6 +390,7 @@ def run_render_gallery(args, gaussians=None):
         ii += 1
 
     # Render each gallery pose with GSplat and save results
+    print("GS gallery rendering - Full-sized image, Cropped image, Depth map, XYZ map")
     for pose in tqdm(gallery["poses"], desc="GS gallery rendering"):
         idx = pose["index"]
         out_name = f"{idx:04d}.png"
@@ -416,6 +418,7 @@ def run_render_gallery(args, gaussians=None):
 
             cv2.imwrite(str(render_crop_dir / f"{idx:04d}c.png"), bgr_crop)            
 
+            # 32-bit float depth map in camera coordinates (same unit as canonical Gaussian means, typically meters). Invalid pixels have value 0.
             depth_np = None
             if args.save_depth:
                 assert depth_hw.ndim == 2, f"Expected depth tensor to have 2 dimensions (H,W), got {depth_hw.shape}. If it has 3 dims, add squeeze"
@@ -507,14 +510,12 @@ def extract_dino_features(args, gallery_bboxes):
 
     features = torch.zeros( size=[len(gallery_bboxes), 384*4], dtype=torch.float32 )  
 
+    render_crop_dir = Path(args.output_dir).parent / "gallery_renders_crop_gs_ds"
     for idx in tqdm(range(len(gallery_bboxes)), desc="DINO feature extraction"):
-        img_path = Path(args.output_dir) / f"{idx:04d}.png"
-        img_rgb = load_rgb(img_path)
-        assert img_rgb.shape[1] == args.width and img_rgb.shape[0] == args.height, f"Image size mismatch: expected ({args.height}, {args.width}), got {img_rgb.shape[:2]}"
-
-        bbox_ext = square_bbox(gallery_bboxes[idx], bbox_size)
-        gallery_crop = crop_with_bbox(img_rgb, bbox_ext)
-
+        img_rgb_crop = load_rgb(render_crop_dir / f"{idx:04d}c.png")
+        assert gallery_bboxes[idx][2] - gallery_bboxes[idx][0] == img_rgb_crop.shape[1] and gallery_bboxes[idx][3] - gallery_bboxes[idx][1] == img_rgb_crop.shape[0], f"Crop size mismatch: expected ({gallery_bboxes[idx][2] - gallery_bboxes[idx][0]}, {gallery_bboxes[idx][3] - gallery_bboxes[idx][1]}), got {img_rgb_crop.shape[1]}, {img_rgb_crop.shape[0]}"
+        gallery_crop = zeropad_square(img_rgb_crop, bbox_size)
+        
         # 4 tiles of DINO input, each tile gets a quarter of the original bbox crop (with some shared margin)
         gallery_crop_dino = square_pad_resize(gallery_crop, dino_in_size * 2)  
         feat = extractor.encode_4rgb(gallery_crop_dino)
@@ -528,14 +529,16 @@ def extract_dino_features(args, gallery_bboxes):
 
     features_np = features.numpy()
     np.save( str(cache_dir / f"gallery_features_{args.dino_model.replace('/', '_')}.npy"), features_np)
+
+    print(f"Saved DINO features {features_np.shape}")
     
     return features # (3024, 1536) CPU tensor
 
 
 def main():
     args = parse_args()
-    # gallery_bboxes = run_render_gallery(args)
-    gallery_bboxes = np.load(Path(args.output_dir) / "gallery_bboxes.npy")
+    gallery_bboxes = run_render_gallery(args)
+    # gallery_bboxes = np.load(Path(args.output_dir) / "gallery_bboxes.npy")
 
     extract_dino_features(args, gallery_bboxes)
 
