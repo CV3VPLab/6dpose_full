@@ -138,3 +138,55 @@ def load_bgr(path):
     if img is None:
         raise FileNotFoundError(f"Failed to load image: {path}")
     return img
+
+
+def construct_queryInfo(path):
+    query_masked_path = path / "query_masked_full.png"
+    assert query_masked_path.exists(), print(f"  [ERROR] query_masked_full.png not found")
+
+    query_full = load_rgb(str(query_masked_path))
+    
+    mask_path = path / "query_mask.png"
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        assert False, f"Query mask not found at: {mask_path}"
+
+    q_bbox = compute_bbox(mask)
+
+    qh, qw = query_full.shape[:2]
+    print(f"  query full image: {qw}x{qh}")
+    print(f"  mask for the query image: {mask.shape[1]}x{mask.shape[0]}")
+    print(f"  query bbox: {q_bbox}, (width={q_bbox[2]-q_bbox[0]}, height={q_bbox[3]-q_bbox[1]})")
+
+    return {
+        "query_full": query_full,   # full query image (RGB)
+                                    # KSCHOI TODO: currently, masked query image is used as full image, 
+                                    # but ideally should be original unmasked RGB query
+        "query_mask": mask,         # full query mask (grayscale, 0=background, 255=foreground)
+        "q_bbox": q_bbox            # query bounding box
+    }
+
+
+def construct_galleryInfo(path):
+    bboxes_path = path / "gallery_renders_gs_ds" / "gallery_bboxes.npy"
+    assert bboxes_path.exists(), f"Gallery bounding boxes not found at: {bboxes_path}"
+    g_bboxes = np.load(str(bboxes_path))
+    
+    cache_dir = path / "dino_cache_3dgs_1920"    
+    print(f"  DINOv2 cache dir: {cache_dir}")
+
+    gallery_feats = np.load( str(cache_dir / "gallery_features_dinov2_vits14.npy") )
+    gfeats = torch.from_numpy(gallery_feats) # (N_gallery, D_feat) tensor
+
+    # Cropped gallery images load
+    gallery_crops = []
+    for idx in range(len(g_bboxes)):
+        gpath = path / "gallery_renders_crop_gs_ds" / f"{idx:04d}c.png"
+        img_rgb = load_rgb(str(gpath))
+        gallery_crops.append(img_rgb)
+
+    return {
+        "gallery_crops": gallery_crops, # cropped gallery images according to g_bboxes
+        "g_bboxes": g_bboxes,           # all the bounding boxes of gallery renders
+        "gfeats": gfeats                # DINOv2 features of gallery crops, used for cosine similarity retrieval  
+    }

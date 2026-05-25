@@ -16,24 +16,22 @@ import torch.nn.functional as F
 import kornia.feature as KF
 
 from .retrieval_dino import (
-    make_query_vs_best_image,
     DinoV2Extractor
 )
 
 from modules_6d.io_utils import (
-    ensure_dir, 
-    save_json
+    ensure_dir
 )
 from utils.image_utils import (
-    expand_bbox, 
     crop_with_bbox,
     get_max_bbox_size,
     square_bbox,
     square_pad_resize,
     load_rgb,
     zeropad_square,
-    compute_bbox,
-    unmap_to_full_image
+    unmap_to_full_image,
+    construct_queryInfo,
+    construct_galleryInfo
 )
 
 TIME_CHECK = False        
@@ -282,40 +280,6 @@ def  run_step5_dino_loftr_rerank(args):
     data_dir = Path(args.out_dir).parent.parent
     ensure_dir(data_dir)
     
-    gallery_dir = Path(args.gallery_dir)
-    g_bboxes = np.load(gallery_dir / "gallery_bboxes.npy")
-    
-    cache_dir = data_dir / "can_data" / "dino_cache_3dgs_1920"    
-    print(f"  DINOv2 cache dir: {cache_dir}")
-
-    gallery_feats = np.load( str(cache_dir / f"gallery_features_{args.dino_model.replace('/', '_')}.npy") )
-    gfeats = torch.from_numpy(gallery_feats) # (N_gallery, D_feat) tensor
-
-    # Cropped gallery images load
-    gallery_crops = []
-    for idx in tqdm(range(len(g_bboxes)), desc="Loading gallery crops"):
-        gpath = gallery_dir.parent / f"gallery_renders_crop_gs_ds/{idx:04d}c.png"
-        img_rgb = load_rgb(str(gpath))
-        gallery_crops.append(img_rgb)
-     
-    # ── 1. Query 로드 ─────────────────────────────────────────────────────────
-    query_masked_path = Path(args.out_dir) / "query_masked_full.png"
-    if not query_masked_path.exists():
-        print(f"  [WARN] query_masked_full.png not found, falling back to query_masked_path")
-        query_masked_path = Path(args.query_masked_path)
-
-    query_full = load_rgb(str(query_masked_path))
-    qh, qw = query_full.shape[:2]
-    print(f"  Masked query full image: {qw}x{qh}")
-
-    query_mask_path = out_dir / "query_mask.png"
-    query_mask = cv2.imread(str(query_mask_path), cv2.IMREAD_GRAYSCALE)
-    if query_mask is None:
-        assert False, f"Query mask not found at: {query_mask_path}"
-
-    q_bbox = compute_bbox(query_mask)
-
-    
     # DINOv2 extractor 초기화
     extractor = DinoV2Extractor(args.dino_model, device=device)
     # LoFTR 초기화
@@ -325,19 +289,15 @@ def  run_step5_dino_loftr_rerank(args):
     # Inputs for LoFTR reranking
     # Data ::
     #######################################################
-    query_info = {
-        "query_full": query_full,   # full query image (RGB)
-                                    # KSCHOI TODO: currently, masked query image is used as full image, 
-                                    # but ideally should be original unmasked RGB query
-        "query_mask": query_mask,   # full query mask (grayscale, 0=background, 255=foreground)
-        "q_bbox": q_bbox            # query bounding box
-    }
-    gallery_info = {
-        "gallery_crops": gallery_crops, # cropped gallery images according to g_bboxes
-        "g_bboxes": g_bboxes,           # all the bounding boxes of gallery renders
-        "gfeats": gfeats                # DINOv2 features of gallery crops, used for cosine similarity retrieval  
-    }
-
+    query_info = construct_queryInfo(out_dir)
+    #     "query_full": query_full,       # full query image (RGB)
+    #     "query_mask": mask,             # full query mask (grayscale, 0=background, 255=foreground)
+    #     "q_bbox": q_bbox                # query bounding box
+    gallery_info = construct_galleryInfo(data_dir / "can_data")
+    #     "gallery_crops": gallery_crops, # cropped gallery images according to g_bboxes
+    #     "g_bboxes": g_bboxes,           # all the bounding boxes of gallery renders
+    #     "gfeats": gfeats                # DINOv2 features of gallery crops, used for cosine similarity retrieval  
+    
     #######################################################
     # Inputs for LoFTR reranking
     # Model ::
@@ -373,8 +333,6 @@ def  run_step5_dino_loftr_rerank(args):
     print("=" * 60)
     print("[Step 5] DINOv2 + LoFTR rerank complete")
     print(f"  best_render     : {best_idx}")
-    print(f"  dino_cache      : {cache_dir}")
-    print(f"  loftr_scores    : {out_dir / 'loftr_scores.json'}")
-    print(f"  match_vis       : {out_dir / 'loftr_matches_best.png'}")
+    print(f"  num_matches     : {len(pts0_full)}")
     print("=" * 60)
 
