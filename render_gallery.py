@@ -1,7 +1,5 @@
 import argparse
 import json
-import math
-import os
 from pathlib import Path
 
 import numpy as np
@@ -16,34 +14,33 @@ from modules_6d.retrieval_dino import DinoV2Extractor
 
 from modules_6d.io_utils import (
     ensure_dir, 
-    save_json
+    save_json,
+    resolve_ply_path
 )
 from utils.image_utils import (
     extract_bbox_and_crop, 
     crop_with_bbox,
     get_max_bbox_size,
-    square_bbox,
     square_pad_resize,
     zeropad_square,
     load_rgb
 )
+from modules_6d.io_utils import load_intrinsics, K_to_params
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Render gallery images from custom poses for GS model")
+    p.add_argument("--out_dir", required=True, type=str)
     p.add_argument("--model_dir", required=True, type=str,
                    help="Canonicalized GS model directory")
     p.add_argument("--gallery_pose_json", required=True, type=str,
                    help="Path to gallery_poses.json")
     p.add_argument("--intrinsics_path", required=True, type=str,
                    help="Path to intrinsics txt file")
-    p.add_argument("--output_dir", required=True, type=str,
-                   help="Directory to save rendered gallery images")
     p.add_argument("--width", required=True, type=int)
     p.add_argument("--height", required=True, type=int)
     p.add_argument("--background", default="0,0,0", type=str,
                    help="R,G,B in 0-255")
-    p.add_argument("--iteration", default=-1, type=int,
-                   help="If -1, use latest iteration under point_cloud/")
     p.add_argument("--sh_degree", default=3, type=int)
     p.add_argument("--convert_SHs_python", action="store_true")
     p.add_argument("--compute_cov3D_python", action="store_true")
@@ -52,9 +49,6 @@ def parse_args():
     p.add_argument("--gs_mode", default="3dgs", choices=["3dgs", "2dgs"])
     p.add_argument("--save_depth", action="store_true")
     p.add_argument("--save_xyz", action="store_true")
-    p.add_argument("--depth_dir", type=str, default=None)
-    p.add_argument("--depth_vis_dir", type=str, default=None)
-    p.add_argument("--xyz_dir", type=str, default=None)
     p.add_argument("--dino_model", type=str, default="dinov2_vits14")
     p.add_argument("--dino_input_size", type=int, default=224)
     return p.parse_args()
@@ -69,57 +63,6 @@ def save_json(path, data):
     ensure_dir(path.parent)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def search_for_max_iteration(point_cloud_dir: Path):
-    iters = []
-    for p in point_cloud_dir.iterdir():
-        if p.is_dir() and p.name.startswith("iteration_"):
-            try:
-                iters.append(int(p.name.split("_")[-1]))
-            except Exception:
-                pass
-    if not iters:
-        raise FileNotFoundError(f"No iteration_* directories found in {point_cloud_dir}")
-    return max(iters)
-
-
-def resolve_ply_path(model_dir: Path, iteration: int):
-    point_cloud_root = model_dir / "point_cloud"
-    if not point_cloud_root.exists():
-        raise FileNotFoundError(f"point_cloud directory not found: {point_cloud_root}")
-
-    if iteration == -1:
-        iteration = search_for_max_iteration(point_cloud_root)
-
-    ply_path = point_cloud_root / f"iteration_{iteration}" / "point_cloud.ply"
-    if not ply_path.exists():
-        raise FileNotFoundError(f"point_cloud.ply not found: {ply_path}")
-
-    return ply_path, iteration
-
-
-def load_intrinsics(path):
-    vals = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            vals.extend([float(x) for x in line.split()])
-
-    if len(vals) == 9:
-        K = np.array(vals, dtype=np.float64).reshape(3, 3)
-        fx = K[0, 0]
-        fy = K[1, 1]
-        cx = K[0, 2]
-        cy = K[1, 2]
-    elif len(vals) == 4:
-        fx, fy, cx, cy = vals
-    else:
-        raise ValueError(f"Unsupported intrinsics format in: {path}")
-
-    return fx, fy, cx, cy
 
 
 def load_gallery_poses(path):
@@ -305,15 +248,6 @@ def save_xyz_reprojection_check(render_bgr, xyz_obj, fx, fy, cx, cy, R, t, out_p
     cv2.imwrite(str(out_path), vis)
 
 
-def load_gaussians(model_dir, iteration=-1, sh_degree=3):
-    """Load GaussianModel from PLY. Call once and keep in GPU memory."""
-    ply_path, resolved_iter = resolve_ply_path(Path(model_dir), iteration)
-    gaussians = GaussianModel(sh_degree)
-    gaussians.load_ply(str(ply_path), use_train_test_exp=False)
-    print(f"[GS] Loaded gaussians: {ply_path}  (iter={resolved_iter})")
-    return gaussians, ply_path, resolved_iter
-
-
 def run_render_gallery(args, gaussians=None):
     """
     Run gallery rendering.
@@ -324,32 +258,28 @@ def run_render_gallery(args, gaussians=None):
         raise RuntimeError("This renderer is expected to run on CUDA.")
 
     model_dir = Path(args.model_dir)    # 3DGS path
-    output_dir = Path(args.output_dir)  # rendered gallery path
-    render_crop_dir = Path(args.output_dir).parent / "gallery_renders_crop_gs_ds"
+    output_dir = Path(args.out_dir)     
+    render_dir = output_dir / "gallery" # rendered gallery path
     ensure_dir(output_dir)
-    ensure_dir(render_crop_dir)
-    
-    depth_dir = Path(args.depth_dir) if args.depth_dir else (Path(args.output_dir).parent / "gallery_depth_gs")
-    depth_vis_dir = Path(args.depth_vis_dir) if args.depth_vis_dir else (Path(args.output_dir).parent / "gallery_depth_vis_gs")
-    xyz_dir = Path(args.xyz_dir) if args.xyz_dir else (Path(args.output_dir).parent / "gallery_xyz_gs")
-
+    ensure_dir(render_dir)
+        
     if args.save_depth:
+        depth_dir = output_dir / "depth"
         ensure_dir(depth_dir)
-        ensure_dir(depth_vis_dir)        
-
+    
     if args.save_xyz:
+        xyz_dir = output_dir / "xyz"
         ensure_dir(xyz_dir)
 
-    gallery = load_gallery_poses(args.gallery_pose_json)
-    fx, fy, cx, cy = load_intrinsics(args.intrinsics_path)
+    galleryPoses = load_gallery_poses(args.gallery_pose_json)["poses"]
+    fx, fy, cx, cy = K_to_params(load_intrinsics(args.intrinsics_path))
 
-    ply_path, resolved_iter = resolve_ply_path(model_dir, args.iteration)
+    ply_path = resolve_ply_path(model_dir)
 
     print("=" * 60)
     print("[render_gallery.py] GS gallery render")
     print(f"  model_dir   : {model_dir}")
     print(f"  ply_path    : {ply_path}")
-    print(f"  iteration   : {resolved_iter}")
     print(f"  width/height: {args.width} x {args.height}")
     print(f"  fx, fy      : {fx:.4f}, {fy:.4f}")
     print(f"  cx, cy      : {cx:.4f}, {cy:.4f}")
@@ -361,39 +291,19 @@ def run_render_gallery(args, gaussians=None):
     else:
         print("[render_gallery.py] Using pre-loaded GaussianModel (skipping PLY load)")
 
-    render_meta = {
-        "model_dir": str(model_dir),
-        "ply_path": str(ply_path),
-        "iteration": resolved_iter,
-        "gallery_pose_json": str(args.gallery_pose_json),
-        "intrinsics_path": str(args.intrinsics_path),
-        "width": args.width,
-        "height": args.height,
-        "fx": fx,
-        "fy": fy,
-        "cx": cx,
-        "cy": cy,
-        "principal_point_handling": "cx_cy_in_projection_matrix",
-        "background": args.background,
-        "gs_mode": args.gs_mode,
-        "num_poses": len(gallery["poses"]),
-        "renders": []
-    }
-
     gallery_bboxes = []
 
     # Sanity check: ensure pose indices are 0...N-1 without gaps
     ii = 0
-    for pose in gallery["poses"]:
+    for pose in galleryPoses:
         idx = pose["index"]
         assert idx == ii, f"Expected pose index {ii}, got {idx}"
         ii += 1
 
     # Render each gallery pose with GSplat and save results
-    print("GS gallery rendering - Full-sized image, Cropped image, Depth map, XYZ map")
-    for pose in tqdm(gallery["poses"], desc="GS gallery rendering"):
-        idx = pose["index"]
-        out_name = f"{idx:04d}.png"
+    print("GS gallery rendering - Cropped rendered image, depth map, XYZ map")
+    for pose in tqdm(galleryPoses, desc="GS gallery rendering"):
+        idx = pose["index"]        
 
         R = np.array(pose["R_obj_to_cam"], dtype=np.float32)
         t = np.array(pose["t_obj_to_cam"], dtype=np.float32)
@@ -410,13 +320,12 @@ def run_render_gallery(args, gaussians=None):
 
             rgb_np = (rgb_chw.permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
             rgb_bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(output_dir / f"{idx:04d}.png"), rgb_bgr)
-
+            
             g_crop_bbox, bgr_crop = extract_bbox_and_crop(rgb_bgr, margin=12, thresh=8)
             gallery_bboxes.append(g_crop_bbox)
             assert len(gallery_bboxes) == idx + 1, f"Index mismatch: expected {idx}, got {len(gallery_bboxes)-1}"
 
-            cv2.imwrite(str(render_crop_dir / f"{idx:04d}c.png"), bgr_crop)            
+            cv2.imwrite(str(render_dir / f"{idx:04d}.png"), bgr_crop)            
 
             # 32-bit float depth map in camera coordinates (same unit as canonical Gaussian means, typically meters). Invalid pixels have value 0.
             depth_np = None
@@ -425,18 +334,14 @@ def run_render_gallery(args, gaussians=None):
                 depth_np = depth_hw.detach().cpu().numpy()
                 assert depth_np.dtype == np.float32, f"Expected depth tensor to be float32, got {depth_np.dtype}"
 
-                # save depth data
-                depth_path = depth_dir / f"{idx:04d}.npy"
-                np.save(str(depth_path), depth_np)
-
                 # save cropped depth data
                 depth_crop = crop_with_bbox(depth_np, g_crop_bbox)
-                fn_crop = depth_dir / f"{idx:04d}c.npy"
+                fn_crop = depth_dir / f"{idx:04d}.npy"
                 np.save(str(fn_crop), depth_crop)
 
                 # save depth visualization for sanity check
-                depth_img = get_depth_img(depth_np)
-                cv2.imwrite(str(depth_vis_dir / f"{idx:04d}.png"), depth_img)
+                # depth_img = get_depth_img(depth_np)
+                # cv2.imwrite(str(depth_dir / f"{idx:04d}.png"), depth_img)
 
             if args.save_xyz:
                 if depth_np is None:
@@ -455,40 +360,25 @@ def run_render_gallery(args, gaussians=None):
                     R_obj_to_cam=pose["R_obj_to_cam"],
                     t_obj_to_cam=pose["t_obj_to_cam"]
                 )
-                np.save(str(xyz_dir / f"{idx:04d}.npy"), xyz_obj)
                 xyz_obj_crop = crop_with_bbox(xyz_obj, g_crop_bbox)
-                np.save(str(xyz_dir / f"{idx:04d}c.npy"), xyz_obj_crop)
+                np.save(str(xyz_dir / f"{idx:04d}.npy"), xyz_obj_crop)
 
-                save_xyz_reprojection_check(
-                    render_bgr=rgb_bgr,
-                    xyz_obj=xyz_obj,
-                    fx=fx,
-                    fy=fy,
-                    cx=cx,
-                    cy=cy,
-                    R=pose["R_obj_to_cam"],
-                    t=pose["t_obj_to_cam"],
-                    out_path=xyz_dir / f"{idx:04d}_reproj_check.png",
-                    stride=250,
-                )
-
-        render_meta["renders"].append({
-            "index": idx,
-            "file": out_name,
-            "azimuth_deg": pose.get("azimuth_deg", None),
-            "elevation_deg": pose.get("elevation_deg", None),
-            "fx": fx,
-            "fy": fy,
-            "cx": cx,
-            "cy": cy,
-            "principal_point_handling": "cx_cy_in_projection_matrix",
-        })
-
-    save_json(output_dir / "render_meta.json", render_meta)
+                # save_xyz_reprojection_check(
+                #     render_bgr=rgb_bgr,
+                #     xyz_obj=xyz_obj,
+                #     fx=fx,
+                #     fy=fy,
+                #     cx=cx,
+                #     cy=cy,
+                #     R=pose["R_obj_to_cam"],
+                #     t=pose["t_obj_to_cam"],
+                #     out_path=xyz_dir / f"{idx:04d}_reproj_check.png",
+                #     stride=250,
+                # )
 
     # save bounding boxes of gallery for later reference
     gallery_bboxes = np.array(gallery_bboxes, dtype=np.int32)
-    np.save(output_dir / "gallery_bboxes.npy", gallery_bboxes)
+    np.save(output_dir / "g_bboxes.npy", gallery_bboxes)
 
     return gallery_bboxes
 
@@ -503,16 +393,14 @@ def extract_dino_features(args, gallery_bboxes):
     extractor = DinoV2Extractor(args.dino_model, device=device) 
     dino_in_size = args.dino_input_size
 
-    cache_dir = Path(args.output_dir).parent.parent / "can_data" / "dino_cache_3dgs_1920"
-    if not (Path(args.output_dir).parent.parent / "can_data").exists():
-        cache_dir = Path(args.output_dir) / "dino_cache_3dgs"
+    cache_dir = Path(args.out_dir)
     print(f"  DINOv2 cache dir: {cache_dir}")
 
     features = torch.zeros( size=[len(gallery_bboxes), 384*4], dtype=torch.float32 )  
 
-    render_crop_dir = Path(args.output_dir).parent / "gallery_renders_crop_gs_ds"
+    render_dir = Path(args.out_dir) / "gallery"
     for idx in tqdm(range(len(gallery_bboxes)), desc="DINO feature extraction"):
-        img_rgb_crop = load_rgb(render_crop_dir / f"{idx:04d}c.png")
+        img_rgb_crop = load_rgb(render_dir / f"{idx:04d}.png")
         assert gallery_bboxes[idx][2] - gallery_bboxes[idx][0] == img_rgb_crop.shape[1] and gallery_bboxes[idx][3] - gallery_bboxes[idx][1] == img_rgb_crop.shape[0], f"Crop size mismatch: expected ({gallery_bboxes[idx][2] - gallery_bboxes[idx][0]}, {gallery_bboxes[idx][3] - gallery_bboxes[idx][1]}), got {img_rgb_crop.shape[1]}, {img_rgb_crop.shape[0]}"
         gallery_crop = zeropad_square(img_rgb_crop, bbox_size)
         
@@ -522,13 +410,12 @@ def extract_dino_features(args, gallery_bboxes):
         assert feat.shape == (384*4,), f"Unexpected DINO feature shape: {feat.shape}"
 
         features[idx] = feat
-
-        feat = feat.numpy()
-        cache_feat_path = cache_dir / f"{idx:04d}_{args.dino_model.replace('/', '_')}.npy"
-        np.save(str(cache_feat_path), feat)
+        # feat = feat.numpy()
+        # cache_feat_path = cache_dir / f"{idx:04d}_{args.dino_model.replace('/', '_')}.npy"
+        # np.save(str(cache_feat_path), feat)
 
     features_np = features.numpy()
-    np.save( str(cache_dir / f"gallery_features_{args.dino_model.replace('/', '_')}.npy"), features_np)
+    np.save( str(cache_dir / f"g_features.npy"), features_np)
 
     print(f"Saved DINO features {features_np.shape}")
     
@@ -538,13 +425,13 @@ def extract_dino_features(args, gallery_bboxes):
 def main():
     args = parse_args()
     gallery_bboxes = run_render_gallery(args)
-    # gallery_bboxes = np.load(Path(args.output_dir) / "gallery_bboxes.npy")
+    # gallery_bboxes = np.load(Path(args.out_dir) / "g_bboxes.npy")
 
     extract_dino_features(args, gallery_bboxes)
 
     print("=" * 60)
     print("[render_gallery.py] Done")
-    print(f"  output_dir : {args.output_dir}")
+    print(f"  output_dir : {args.out_dir}")
     print("=" * 60)
 
 

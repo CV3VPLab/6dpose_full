@@ -1,12 +1,9 @@
-import json
 import math
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import csv
 
-import time
 from tqdm import tqdm
 
 import cv2
@@ -15,26 +12,8 @@ import numpy as np
 from utils.image_utils import load_bgr
 from utils.geom_utils import rotation_matrix_to_quaternion
 
-from modules_6d.io_utils import  ensure_dir, save_json, load_json
+from modules_6d.io_utils import  ensure_dir, save_json, load_json, load_intrinsics, K_to_params
 
-
-def load_intrinsics(path):
-    vals = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            vals.extend([float(x) for x in line.split()])
-
-    if len(vals) == 9:
-        K = np.array(vals, dtype=np.float64).reshape(3, 3)
-    elif len(vals) == 4:
-        fx, fy, cx, cy = vals
-        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    else:
-        raise ValueError(f"Unsupported intrinsics format: {path}")
-    return K
 
 
 def lookup_xyz(xyz_map, pts_uv, bilinear=True):
@@ -1123,8 +1102,7 @@ def refine_translation_xyz_with_mask(
         info["status"] = "skipped_invalid_query_mask"
         return t_cur, info
 
-    fy = float(K[1, 1])
-    fx = float(K[0, 0])
+    fx, fy = K[0, 0], K[1, 1]
 
     tz_bbox = estimate_tz_from_mask_bbox(query_mask_img, fy=fy, object_height_m=object_height_m)
     info["tz_bbox_prior"] = float(tz_bbox) if tz_bbox is not None else None
@@ -1409,37 +1387,28 @@ def run_step6_translation(args):
 
     # Camera intrinsics
     K = load_intrinsics(args.intrinsics_path)
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
+    fx, fy, cx, cy = K_to_params(K)
 
     print(f"  K: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
 
     # best gallery index
-    loftr_json_path = out_dir / "loftr_scores.json"
-    loftr_json = load_json(loftr_json_path)
-    best_render = int(loftr_json["best_render"])
+    loftr_out_path = out_dir / "matched_pairs.npz"
+    match_data = np.load(loftr_out_path)
+    best_render = int(match_data["best_idx"])
 
     # bounding boxes for gallery renders
-    gallery_dir = Path(args.gallery_xyz_dir).parent / "gallery_renders_gs_ds"
-    g_bboxes = np.load(gallery_dir / "gallery_bboxes.npy")
+    g_bboxes = np.load(Path(args.out_dir) / "g_bboxes.npy")
 
     g_bbox = g_bboxes[best_render]
 
     # best render의 pose 정보 (R, t) 가져오기
-    gallery = load_json(args.gallery_pose_json)
-    R0, t0 = get_gallery_pose(gallery["poses"], best_render)
+    galleryInfo = load_json(args.gallery_pose_json)
+    R0, t0 = get_gallery_pose(galleryInfo["poses"], best_render)
     
     # reprojection error threshold for PnP in pixels (step5에서 이보다 작은 reprojection error를 가진 점들을 inlier로 간주)
     reproj_thresh = float(getattr(args, "pnp_reproj_error", 10.0))
 
     # matching information
-    npz_path = out_dir / "loftr_best_match_data.npz"
-    if not npz_path.exists():
-        raise FileNotFoundError(
-            f"loftr_best_match_data.npz not found: {npz_path}\n step 5 PnP를 먼저 실행하세요."
-        )
-    
-    match_data = np.load(str(npz_path))
     pts_q_full = match_data["mkpts0"]
     pts_g_full = match_data["mkpts1"]
     conf = match_data["conf"]
@@ -1448,12 +1417,11 @@ def run_step6_translation(args):
     assert len(pts_q_full) > 0
     
     # construct the corresponding XYZ map 
-    xyz_dir = Path(args.gallery_xyz_dir)
+    xyz_dir = Path(args.out_dir) / "xyz"
     
     cropped_xyz_maps = []
     for idx in tqdm(range(len(g_bboxes)), desc="Loading xyz crops"):
-        xyz_dir = Path(args.gallery_xyz_dir)
-        xyz_mapc_path = xyz_dir / f"{idx:04d}c.npy"
+        xyz_mapc_path = xyz_dir / f"{idx:04d}.npy"
         cropped_xyz_maps.append(np.load(str(xyz_mapc_path)).astype(np.float64) )
 
     # Get initial pose using the matched 2D-3D correspondences and PnP
@@ -1469,117 +1437,6 @@ def run_step6_translation(args):
     n_valid = match_counts[-1][1]
     assert n_valid == len(inlier_idx), "Length mismatch after get_initial_pose"
     
-    # if not _gallery_render_path.exists():
-    #     _gallery_render_path = xyz_dir.parent / "gallery_renders" / best_render
-    
-    # _save_correspondence_debug(
-    #     out_dir=out_dir,
-    #     query_img=query_img,
-    #     gallery_render_path=_gallery_render_path,
-    #     pts2d_query=pts2d_corr,
-    #     pts3d_obj=pts3d_corr,
-    #     pts2d_gallery=pts_g_corr,
-    #     R=R_out, t=t_out, K=K,
-    #     inlier_idx=inlier_idx,
-    # )
-
-    # xyz_refine_info = {"status": "not_run"}
-    # skip_t_refine    = bool(getattr(args, "skip_t_refine", False))
-
-    # if skip_t_refine:
-    #     print("  [xyz refine] skipped (--skip_t_refine)")
-    #     xyz_refine_info["status"] = "skipped_by_flag"
-    # else: 
-    #     t_pnp = t_out.copy()
-    #     iou_accept_thresh = float(getattr(args, "t_refine_iou_thresh", 0.30))
-
-    #     query_img = load_bgr(args.query_img)
-    #     query_masked_img = None
-    #     if getattr(args, "query_masked_path", None):
-    #         qmp = Path(args.query_masked_path)
-    #         if qmp.exists():
-    #             query_masked_img = load_bgr(qmp)
-    #         else:
-    #             print(f"  [WARN] query_masked_path not found: {qmp}")
-    
-    #     render_width = int(getattr(args, "render_width", query_img.shape[1]))
-    #     render_height = int(getattr(args, "render_height", query_img.shape[0]))
-    #     gs_model_dir = getattr(args, "gs_model_dir", None)
-    #     gs_iter = getattr(args, "gs_iter", None)
-    #     gs_repo = getattr(args, "gs_repo", None)
-    #     gs_python = getattr(args, "gs_python", None) or sys.executable
-    #     bg_color = getattr(args, "bg_color", "0,0,0")
-    #     gs_mode = getattr(args, "gs_mode", "2dgs")
-        
-    #     if gs_model_dir and gs_iter is not None and gs_repo and gs_python:
-    #         query_ref_mask = make_query_reference_mask(
-    #             query_masked_img=query_masked_img,
-    #             query_mask_path=(out_dir / "query_mask.png"),
-    #             nonblack_thresh=8,
-    #         )
-
-    #         object_height_m = float(getattr(args, "object_height_m", 0.125))
-
-    #         if query_ref_mask is not None:
-    #             tz_bbox = estimate_tz_from_mask_bbox(
-    #                 query_ref_mask,
-    #                 fy=K[1, 1],
-    #                 object_height_m=object_height_m,
-    #             )
-
-    #             if tz_bbox is not None:
-    #                 rel_err = abs(float(t_out[2]) - float(tz_bbox)) / max(float(tz_bbox), 1e-8)
-    #                 print(f"  [tz prior] bbox-based tz={tz_bbox:.4f} m, "
-    #                     f"PnP tz={float(t_out[2]):.4f} m, rel_err={rel_err * 100.0:.1f}%")
-
-    #             t_refined, xyz_refine_info = refine_translation_xyz_with_mask(
-    #                 R=R_out,
-    #                 t_init=t_out,
-    #                 K=K,
-    #                 width=render_width,
-    #                 height=render_height,
-    #                 query_mask_img=query_ref_mask,
-    #                 object_height_m=object_height_m,
-    #                 gs_python=gs_python,
-    #                 gs_repo=gs_repo,
-    #                 gs_model_dir=gs_model_dir,
-    #                 gs_iter=gs_iter,
-    #                 intrinsics_path=args.intrinsics_path,
-    #                 bg_color=bg_color,
-    #                 nonblack_thresh=8,
-    #                 prior_range=(0.80, 1.20),
-    #                 num_iters=4,
-    #                 alpha_xy=0.65,
-    #                 alpha_z=0.55,
-    #             )
-
-    #             best_score = xyz_refine_info.get("best_score") or -1.0
-    #             best_iou   = (xyz_refine_info.get("best_metrics") or {}).get("iou", 0.0)
-    #             t_ref      = np.asarray(xyz_refine_info["t_refined"], dtype=np.float64)
-
-    #             print(f"  [xyz refine] status={xyz_refine_info['status']}, "
-    #                 f"best_score={best_score:.4f}, best_iou={best_iou:.4f} "
-    #                 f"(threshold={iou_accept_thresh:.2f})")
-    #             print(f"  [xyz refine] t_pnp=[{t_pnp[0]:.4f}, {t_pnp[1]:.4f}, {t_pnp[2]:.4f}]")
-    #             print(f"  [xyz refine] t_ref=[{t_ref[0]:.4f}, {t_ref[1]:.4f}, {t_ref[2]:.4f}]")
-
-    #             if best_iou >= iou_accept_thresh:
-    #                 t_out = t_refined
-    #                 xyz_refine_info["t_applied"] = True
-    #                 print(f"  [xyz refine] IoU={best_iou:.4f} >= {iou_accept_thresh:.2f} -> t_refined applied")
-    #             else:
-    #                 t_out = t_pnp
-    #                 xyz_refine_info["t_applied"] = False
-    #                 print(f"  [xyz refine] IoU={best_iou:.4f} < {iou_accept_thresh:.2f} -> PnP t kept")
-    #         else:
-    #             print("  [xyz refine] query reference mask unavailable, skipping.")
-    #             xyz_refine_info["status"] = "skipped_no_query_mask"
-    #     else:
-    #         print("  [xyz refine] GS render args missing, skipping.")
-    #         xyz_refine_info["status"] = "skipped_no_gs_args"
-
-    # assert len(inlier_idx) > 0, "No inlier points found"
-    
     pts2d = pts_q_full[inlier_idx]
     pts3d = pts3d[inlier_idx]
     reproj_stats_after_inliers = compute_mean_reprojection_error(
@@ -1590,148 +1447,6 @@ def run_step6_translation(args):
         f"median={reproj_stats_after_inliers['median_px']:.2f}px, "
         f"max={reproj_stats_after_inliers['max_px']:.2f}px, "
         f"N={reproj_stats_after_inliers['num_points']}")
-
-
-    # reproj_debug_path = out_dir / "step6_reproj_debug_inliers.png"
-    # reproj_debug_stats_path = out_dir / "step6_reproj_debug_inliers_stats.json"
-
-    
-
-    # draw_correspondence_debug_single_pose(
-    #     query_img=query_img,
-    #     pts2d_query=pts2d,
-    #     pts3d_obj=pts3d,
-    #     K=K,
-    #     R=R,
-    #     t=t,
-    #     out_path=reproj_debug_path,
-    #     draw_idx=np.random.default_rng(42).rng_in.choice(n_valid, size=min(n_valid, 120), replace=False),
-    #     title_prefix="PnP inliers only (after pose)",
-    #     stats_json_path=reproj_debug_stats_path,
-    # )
-
-    # post_gs_render_path = None
-    # post_gs_overlay_path = None
-    # post_gs_xyz_path = None
-
-    # if gs_model_dir and gs_iter is not None and gs_repo and gs_python:
-    #     post_pose_json = out_dir / "step6_pose_after_pnp.json"
-    #     post_gs_render_path = out_dir / "step6_gs_render_after_pnp.png"
-    #     post_gs_overlay_path = out_dir / "step6_gs_render_overlay_after_pnp.png"
-    #     post_gs_xyz_path = out_dir / "step6_gs_render_after_pnp_xyz.npy"
-
-    #     save_camera_pose_json(
-    #         post_pose_json,
-    #         K=K,
-    #         R=R_out,
-    #         t=t_out,
-    #         width=render_width,
-    #         height=render_height,
-    #     )
-
-    #     try:
-    #         render_single_pose_gs(
-    #             gs_python=gs_python,
-    #             gs_repo=gs_repo,
-    #             gs_model_dir=gs_model_dir,
-    #             gs_iter=gs_iter,
-    #             intrinsics_path=args.intrinsics_path,
-    #             pose_json_path=post_pose_json,
-    #             output_png_path=post_gs_render_path,
-    #             width=render_width,
-    #             height=render_height,
-    #             bg_color=bg_color,
-    #             gs_mode=gs_mode,
-    #             save_xyz=True,
-    #             xyz_output_path=post_gs_xyz_path,
-    #         )
-    #         post_render_img = load_image(post_gs_render_path)
-    #         overlay_render_on_query(
-    #             query_img=query_img,
-    #             render_img=post_render_img,
-    #             out_path=post_gs_overlay_path,
-    #             alpha=0.45,
-    #             nonblack_thresh=8,
-    #         )
-    #     except Exception as e:
-    #         print(f"  [WARN] Failed to render GS after PnP: {e}")
-    #         post_gs_render_path = None
-    #         post_gs_overlay_path = None
-    #         post_gs_xyz_path = None
-    # else:
-    #     print("  [WARN] GS render args missing for after-PnP render overlay")
-
-    # bad_inlier_local_idx = np.array([], dtype=np.int32)
-    # bad_corr_global_idx = np.array([], dtype=np.int32)
-
-    # if len(pts2d_inliers) > 0 and post_gs_render_path is not None and Path(post_gs_render_path).exists():
-    #     post_render_img = load_image(post_gs_render_path)
-
-    #     bad_inlier_local_idx, proj_after_all_inliers = get_outside_after_inlier_indices(
-    #         pts3d_inliers=pts3d_inliers,
-    #         K=K,
-    #         R_after=R_out,
-    #         t_after=t_out,
-    #         render_img_after=post_render_img,
-    #         nonblack_thresh=8,
-    #     )
-
-    #     if len(bad_inlier_local_idx) > 0:
-    #         bad_corr_global_idx = inlier_idx[bad_inlier_local_idx].astype(np.int32)
-
-    #     print(f"  [Prune candidates] outside-after-render inliers: {len(bad_inlier_local_idx)}")
-
-    #     save_json(out_dir / "step6_bad_after_render_inliers.json", {
-    #         "bad_inlier_local_idx": bad_inlier_local_idx.tolist(),
-    #         "bad_corr_global_idx": bad_corr_global_idx.tolist(),
-    #         "num_bad_after_render": int(len(bad_inlier_local_idx)),
-    #     })
-    # else:
-    #     print("  [Prune candidates] skipped (no inliers or no post render)")
-
-    # if len(bad_corr_global_idx) > 0:
-    #     keep_corr_mask = np.ones(len(pts2d_corr), dtype=bool)
-    #     keep_corr_mask[bad_corr_global_idx] = False
-
-    #     keep_inlier_mask = np.ones(len(pts2d_inliers), dtype=bool)
-    #     keep_inlier_mask[bad_inlier_local_idx] = False
-
-    # try:
-    #     if post_gs_xyz_path is not None and Path(post_gs_xyz_path).exists():
-    #         post_xyz_map_samecorr = np.load(str(post_gs_xyz_path)).astype(np.float64)
-
-    #         same_corr_trace = build_same_corr_motion_trace(
-    #             pts2d_query_obs=pts2d_corr,
-    #             pts2d_gallery_obs=pts_g_corr,
-    #             pts3d_obj=pts3d_corr,
-    #             K=K,
-    #             R_before=R_gallery,
-    #             t_before=t_gallery,
-    #             R_after=R_out,
-    #             t_after=t_out,
-    #         )
-
-    #         same_corr_surface_trace = augment_same_corr_trace_with_postrender_surface(
-    #             trace=same_corr_trace,
-    #             post_xyz_map=post_xyz_map_samecorr,
-    #             xyz_err_bad_thresh_m=0.005,
-    #         )
-
-    #         save_json(out_dir / "step6_same_corr_postrender_surface_trace.json", same_corr_surface_trace)
-    #         save_same_corr_surface_csv(out_dir / "step6_same_corr_postrender_surface_trace.csv", same_corr_surface_trace)
-
-    #         ss = same_corr_surface_trace["summary"]
-    #         print(
-    #             f"  [Same corr post-render surface] "
-    #             f"valid={ss['num_post_xyz_valid']}/{same_corr_surface_trace['num_points']}  "
-    #             f"bad={ss['num_surface_bad']}  "
-    #             f"mean_surface_err={None if ss['mean_surface_err_m'] is None else ss['mean_surface_err_m']*1000:.2f}mm"
-    #         )
-    #         print("  [Same corr post-render surface] saved: step6_same_corr_postrender_surface_trace.json/csv")
-    #     else:
-    #         print("  [Same corr post-render surface] skipped (post XYZ unavailable)")
-    # except Exception as e:
-    #     print(f"  [Same corr post-render surface] failed: {e}")
 
     pose_out = {
         "stage": "step6",
@@ -1744,7 +1459,7 @@ def run_step6_translation(args):
         "R_gallery_init": R0.tolist()
     }
 
-    save_json(out_dir / "step6_pose.json", pose_out)
+    save_json(out_dir / "T0.json", pose_out)
     
     print("=" * 60)
     print("[Step 6] PnP translation estimation complete")

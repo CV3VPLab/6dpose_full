@@ -1,9 +1,15 @@
 import os
+import sys
+import argparse
 import cv2
 import numpy as np
 
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+
 from .io_utils import ensure_dir, load_image, save_json
-from .image_utils import expand_bbox, crop_from_bbox, apply_mask, crop_mask_to_bbox
+from utils.image_utils import expand_bbox, crop_with_bbox, compute_bbox, apply_mask
 from .manual_bbox import select_bbox_opencv
 from .viz_utils import draw_bbox, make_mask_overlay
 from .yolo_sam import load_yolo_model, detect_with_yolo, load_sam2_predictor, segment_from_bbox
@@ -43,51 +49,41 @@ def run_step1_query_extraction(args):
     )
     mask, sam_score = segment_from_bbox(predictor, image, bbox)
 
+    from pathlib import Path
+    outPath = Path(args.out_dir)
+    queryPath = Path(args.query_img)
+    maskPath = outPath / f"q_mask_{queryPath.stem}.png"
+    
+    cv2.imwrite(str(maskPath), mask)
+    
     bbox_vis = draw_bbox(image, bbox, label=detector_name)
     mask_overlay = make_mask_overlay(image, mask)
+    query_crop = crop_with_bbox(image, bbox)
+    masked_query = apply_mask(image, mask)
+    
+    mask_bbox = compute_bbox(mask)    
 
-    crop_bbox = crop_from_bbox(image, bbox)
-    masked_image = apply_mask(image, mask)
-    crop_mask = crop_mask_to_bbox(mask, bbox)
-    crop_masked = crop_from_bbox(masked_image, bbox)
+    bboxPath = outPath / f"q_bbox_{queryPath.stem}.npy"
+    np.save(bboxPath, mask_bbox)
 
-    # full size masked image (배경 검정, 3840x2160 그대로)
-    # 이후 모든 단계에서 crop 없이 full image 좌표계로 일관되게 사용
-    masked_full = apply_mask(image, mask)  # 배경 검정, full 해상도
-
-    # cv2.imwrite(os.path.join(args.out_dir, "query_with_bbox.png"), bbox_vis)
-    cv2.imwrite(os.path.join(args.out_dir, "query_mask.png"), mask)
-    # cv2.imwrite(os.path.join(args.out_dir, "query_mask_overlay.png"), mask_overlay)
-    # cv2.imwrite(os.path.join(args.out_dir, "query_crop_bbox.png"), crop_bbox)
-    # cv2.imwrite(os.path.join(args.out_dir, "query_crop_masked.png"), crop_masked)
-    cv2.imwrite(os.path.join(args.out_dir, "query_masked_full.png"), masked_full)
-
-    ys, xs = np.where(mask > 0)
-    mask_area = int((mask > 0).sum())
-    mask_bbox = None
-    if len(xs) > 0 and len(ys) > 0:
-        mask_bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
-
-    result = {
-        "query_img": args.query_img,
-        "detector": detector_name,
-        "yolo_success": yolo_success,
-        "manual_fallback_used": manual_fallback_used,
-        "bbox_xyxy": [int(v) for v in bbox],
-        "bbox_conf": bbox_conf,
-        "sam_score": sam_score,
-        "mask_area": mask_area,
-        "mask_bbox_xyxy": mask_bbox,
-        "crop_size_hw": [int(crop_bbox.shape[0]), int(crop_bbox.shape[1])],
-        "crop_mask_size_hw": [int(crop_mask.shape[0]), int(crop_mask.shape[1])],
-        "saved_files": {
-            "query_with_bbox": os.path.join(args.out_dir, "query_with_bbox.png"),
-            "query_mask": os.path.join(args.out_dir, "query_mask.png"),
-            "query_mask_overlay": os.path.join(args.out_dir, "query_mask_overlay.png"),
-            "query_crop_bbox": os.path.join(args.out_dir, "query_crop_bbox.png"),
-            "query_crop_masked": os.path.join(args.out_dir, "query_crop_masked.png"),
-            "query_masked_full": os.path.join(args.out_dir, "query_masked_full.png"),
-        }
-    }
-    save_json(os.path.join(args.out_dir, "step1_result.json"), result)
     print("[OK] Step 1 finished:", args.out_dir)
+    print(f"query bounding box : {mask_bbox}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Render gallery images from custom poses for GS model")
+    p.add_argument("--out_dir", type=str, required=True)
+    p.add_argument("--query_img", type=str, default=None)
+    p.add_argument("--yolo_weights", type=str, default=None)
+    p.add_argument("--sam2_checkpoint", type=str, default=None)
+    p.add_argument("--sam2_repo", type=str, default=None)
+    p.add_argument("--sam2_config", type=str, default=None)
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--yolo_conf", type=float, default=0.25)
+    p.add_argument("--bbox_margin", type=int, default=10)
+    p.add_argument("--use_manual_fallback", action="store_true")
+    return p.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_step1_query_extraction(args)

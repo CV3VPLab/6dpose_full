@@ -466,3 +466,19 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    # KSCHOI added
+    # Freeze all Gaussian parameters: only delta_r and delta_t should be
+    # in the autograd graph.  Without this, loss.backward() computes (and
+    # accumulates) gradients for every nn.Parameter in GaussianModel on
+    # every iteration.  optimizer.zero_grad() only zeros delta_r / delta_t,
+    # so Gaussian grads pile up, growing the retained graph and introducing
+    # numerical drift that differs between in-process (RT) and subprocess
+    # (non-RT) execution contexts.
+    # GaussianModel is NOT an nn.Module, so iterate its Parameters manually.
+    def freeze_except_pose(self):
+        for _attr in ("_xyz", "_features_dc", "_features_rest",
+                  "_scaling", "_rotation", "_opacity", "_exposure"):
+            _p = getattr(self, _attr, None)
+            if isinstance(_p, torch.nn.Parameter):
+                _p.requires_grad_(False)

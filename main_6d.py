@@ -85,7 +85,6 @@ def build_parser():
     # -------------------------
     # Step 5 (similarity)
     # -------------------------
-    p.add_argument("--query_masked_path", type=str, default=None)
     p.add_argument("--gallery_dir", type=str, default=None)
     p.add_argument("--sim_method", type=str, default="dino", choices=["dino", "loftr", "dino_loftr"])
     p.add_argument("--dino_model", type=str, default="dinov2_vits14")
@@ -96,7 +95,6 @@ def build_parser():
     p.add_argument("--loftr_pretrained", type=str, default="outdoor", choices=["outdoor", "indoor"])
     p.add_argument("--loftr_conf_thresh", type=float, default=0.5)
     p.add_argument("--loftr_ransac_thresh", type=float, default=3.0)
-    p.add_argument("--dino_scores_json", type=str, default=None) 
     p.add_argument("--step1_json", type=str, default=None)
     p.add_argument("--object_height_m", type=float, default=0.125)
     p.add_argument("--axis_len_m", type=float, default=0.04)
@@ -113,18 +111,9 @@ def build_parser():
     p.add_argument("--no_pnp_ransac", action="store_true",
                    help="Disable RANSAC in PnP: use all correspondences with ITERATIVE solvePnP")
     p.add_argument("--no_pnp", action="store_true",
-                   help="Skip PnP entirely: use R_gallery + bbox-based t_init → t_refine only")
-    p.add_argument("--query_mask_path", type=str, default=None)
-    p.add_argument("--step5_json", type=str, default=None)
-    p.add_argument("--gallery_rgb_dir", type=str, default=None)
-    p.add_argument("--gallery_xyz_dir", type=str, default=None)
-    p.add_argument("--gallery_meta_json", type=str, default=None)
+                   help="Skip PnP entirely: use R_gallery + bbox-based t_init → t_refine only")    
     p.add_argument("--pnp_reproj_error", type=float, default=4.0)
-    p.add_argument("--query_top_exclude_ratio", type=float, default=0.18)
-    p.add_argument("--render_top_exclude_ratio", type=float, default=0.18)
-    p.add_argument("--pre_pnp_ransac_mode", type=str, default="homography",
-                   choices=["homography", "fundamental", "none"])
-    p.add_argument("--pre_pnp_ransac_thresh", type=float, default=3.0)
+
 
     # -------------------------
     # Step 7 (pose refinement)

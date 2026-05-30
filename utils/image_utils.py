@@ -12,7 +12,7 @@
 import torch
 import cv2
 import numpy as np
-
+from pathlib import Path
 
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
@@ -82,6 +82,10 @@ def square_bbox(bbox, bbox_size):
     return bbox_ext
 
 
+def get_bbox_size(bbox):
+    return max(bbox[2]-bbox[0], bbox[3]-bbox[1])
+
+ 
 def get_max_bbox_size(bboxes):
     bbox_w = np.max( bboxes[:,2] - bboxes[:,0] )
     bbox_h = np.max( bboxes[:,3] - bboxes[:,1] )
@@ -126,6 +130,14 @@ def unmap_to_full_image(pts_crop, bbox, resize_target):
     return pts_unscaled + np.array([[bbox[0], bbox[1]]], dtype=pts_crop.dtype)
 
 
+def apply_mask(image, mask):
+    if mask.dtype != np.uint8:
+        mask = (mask > 0).astype(np.uint8) * 255
+    out = np.zeros_like(image)
+    out[mask > 0] = image[mask > 0]
+    return out
+
+
 def load_rgb(path):
     img = cv2.imread(str(path), cv2.IMREAD_COLOR_RGB)
     if img is None:
@@ -140,13 +152,13 @@ def load_bgr(path):
     return img
 
 
-def construct_queryInfo(path):
-    query_masked_path = path / "query_masked_full.png"
-    assert query_masked_path.exists(), print(f"  [ERROR] query_masked_full.png not found")
+def construct_queryInfo(query_img, out_dir):
+    q_path = Path(query_img) 
+    assert q_path.exists(), print(f"  [ERROR] query image [{query_img}] not found")
 
-    query_full = load_rgb(str(query_masked_path))
+    query_full = load_rgb(str(q_path))
     
-    mask_path = path / "query_mask.png"
+    mask_path = out_dir / f"q_mask_{q_path.stem}.png"
     mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if mask is None:
         assert False, f"Query mask not found at: {mask_path}"
@@ -167,21 +179,20 @@ def construct_queryInfo(path):
     }
 
 
-def construct_galleryInfo(path):
-    bboxes_path = path / "gallery_renders_gs_ds" / "gallery_bboxes.npy"
+def construct_galleryInfo(out_dir):
+    bboxes_path = out_dir / "g_bboxes.npy"
     assert bboxes_path.exists(), f"Gallery bounding boxes not found at: {bboxes_path}"
     g_bboxes = np.load(str(bboxes_path))
     
-    cache_dir = path / "dino_cache_3dgs_1920"    
-    print(f"  DINOv2 cache dir: {cache_dir}")
+    print(f"  DINOv2 cache dir: {out_dir}")
 
-    gallery_feats = np.load( str(cache_dir / "gallery_features_dinov2_vits14.npy") )
+    gallery_feats = np.load( str(out_dir / "g_features.npy") )
     gfeats = torch.from_numpy(gallery_feats) # (N_gallery, D_feat) tensor
 
     # Cropped gallery images load
     gallery_crops = []
     for idx in range(len(g_bboxes)):
-        gpath = path / "gallery_renders_crop_gs_ds" / f"{idx:04d}c.png"
+        gpath = out_dir / "gallery" / f"{idx:04d}.png"
         img_rgb = load_rgb(str(gpath))
         gallery_crops.append(img_rgb)
 

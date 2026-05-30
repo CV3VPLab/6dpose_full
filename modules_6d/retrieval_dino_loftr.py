@@ -5,9 +5,7 @@ step5: DINOv2 LoFTR
 """
 
 import time
-import json
 from pathlib import Path
-from tqdm import tqdm
 
 import cv2
 import numpy as np
@@ -27,7 +25,6 @@ from utils.image_utils import (
     get_max_bbox_size,
     square_bbox,
     square_pad_resize,
-    load_rgb,
     zeropad_square,
     unmap_to_full_image,
     construct_queryInfo,
@@ -271,15 +268,12 @@ def  run_step5_dino_loftr_rerank(args):
     query_masked_path: query_masked_full.png (full 해상도, 배경 검정)
     query_image: RGB image 가정 (sensor로부터 얻어질 때 RGB라 가정)
     """
-    if args.dino_scores_json is None:
-        pass
-
     device = args.device if torch.cuda.is_available() else "cpu"
 
     out_dir = Path(args.out_dir)
     data_dir = Path(args.out_dir).parent.parent
     ensure_dir(data_dir)
-    
+
     # DINOv2 extractor 초기화
     extractor = DinoV2Extractor(args.dino_model, device=device)
     # LoFTR 초기화
@@ -289,11 +283,11 @@ def  run_step5_dino_loftr_rerank(args):
     # Inputs for LoFTR reranking
     # Data ::
     #######################################################
-    query_info = construct_queryInfo(out_dir)
+    query_info = construct_queryInfo(args.query_img, out_dir)
     #     "query_full": query_full,       # full query image (RGB)
     #     "query_mask": mask,             # full query mask (grayscale, 0=background, 255=foreground)
     #     "q_bbox": q_bbox                # query bounding box
-    gallery_info = construct_galleryInfo(data_dir / "can_data")
+    gallery_info = construct_galleryInfo(out_dir)
     #     "gallery_crops": gallery_crops, # cropped gallery images according to g_bboxes
     #     "g_bboxes": g_bboxes,           # all the bounding boxes of gallery renders
     #     "gfeats": gfeats                # DINOv2 features of gallery crops, used for cosine similarity retrieval  
@@ -323,7 +317,7 @@ def  run_step5_dino_loftr_rerank(args):
         print(f"  Feature-based Retrieval & LoFTR matching time : {end_time - start_time:.6f} seconds")
 
     save_best_match_data(
-        npz_path = out_dir / "loftr_best_match_data.npz",
+        npz_path = out_dir / "matched_pairs.npz",
         pts0 = pts0_full,
         pts1 = pts1_full,
         conf = conf,
