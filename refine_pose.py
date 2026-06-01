@@ -28,7 +28,7 @@ from gsplat import rasterization as _gsplat_rasterize_3dgs
 from gsplat import rasterization_2dgs as _gsplat_rasterize_2dgs
 
 from utils.image_utils import construct_queryInfo, get_bbox_size, square_bbox, crop_with_bbox, apply_mask
-from modules_6d.io_utils import (
+from utils.io_utils import (
     ensure_dir, save_json, load_json, 
     load_intrinsics, K_to_params, 
     resolve_ply_path
@@ -360,12 +360,23 @@ class RigidPoseGaussianProxy:
     Gaussians 자체는 고정, pose 파라미터(delta_r, delta_t)를 통해 gradient 흐름.
     GS-Pose와 달리 delta를 내부에 넣지 않고 외부에서 주입하는 방식.
     """
-    def __init__(self, base, R_obj2cam, t_obj2cam):
+    def __init__(self, base, R_obj2cam, t_obj2cam, K=None, bg_val=None):
         self.base = base
+        if isinstance(R_obj2cam, np.ndarray):
+            R_obj2cam = self.toGPUTensor(R_obj2cam)
+        if isinstance(t_obj2cam, np.ndarray):
+            t_obj2cam = self.toGPUTensor(t_obj2cam)
         self.R = R_obj2cam   # [3,3] torch
         self.t = t_obj2cam   # [3] torch
         self.active_sh_degree = base.active_sh_degree
         self.max_sh_degree    = base.max_sh_degree
+
+        # Pre-compute gsplat render constants (identity viewmat + K)
+        self.viewmat = torch.eye(4, dtype=torch.float32, device='cuda').unsqueeze(0)  # (1,4,4)
+        if K is not None:
+            self.K_mat = torch.tensor(K, dtype=torch.float32, device='cuda').unsqueeze(0)  # (1,3,3)
+        if bg_val is not None:
+            self.bg = torch.tensor(bg_val, dtype=torch.float32, device='cuda').unsqueeze(0)  # (1,3)
 
     @property
     def get_xyz(self):
@@ -399,8 +410,18 @@ class RigidPoseGaussianProxy:
     
     # KSCHOI added
     def set_T(self, R, t):
+        if isinstance(R, np.ndarray):
+            R = self.toGPUTensor(R)
+        if isinstance(t, np.ndarray):
+            t = self.toGPUTensor(t)
         self.R = R
         self.t = t
+
+    def get_T(self):
+        return self.R, self.t
+
+    def toGPUTensor(self, arr):
+        return torch.tensor(arr.astype(np.float32), dtype=torch.float32, device='cuda')
 
 
 # ──────────────────────────────────────────────────────────
@@ -525,7 +546,7 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
     # ──────────────────────────────────────────────────────
     query_info = construct_queryInfo(args.query_img, output_dir)
 
-    q_bbox = np.array(query_info["q_bbox"])
+    q_bbox = np.array(query_info["bbox"])
     q_side = get_bbox_size(q_bbox)
     q_bbox_ext = square_bbox(q_bbox, int(q_side * 1.2) )
 
@@ -534,11 +555,11 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
     # ──────────────────────────────────────────────────────
     # 2. query 이미지 crop → tensor (numpy, 시각화용)
     # ──────────────────────────────────────────────────────
-    qm = crop_with_bbox(query_info["query_mask"], q_bbox_ext)
+    qm = crop_with_bbox(query_info["mask"], q_bbox_ext)
     query_mask = torch.from_numpy(qm).float() / 255.0
     query_mask = query_mask.to(device)
 
-    qc = crop_with_bbox(query_info["query_full"], q_bbox_ext)
+    qc = crop_with_bbox(query_info["rgb"], q_bbox_ext)
     qc = apply_mask(qc, qm)
     query_crop = torch.from_numpy(qc).float().permute(2,0,1) / 255.0
     query_crop = query_crop.to(device)
@@ -734,29 +755,7 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
         q_np = cv2.cvtColor(
             (query_crop.cpu().permute(1,2,0).numpy()*255).clip(0,255).astype(np.uint8),
             cv2.COLOR_RGB2BGR)
-        comp = np.zeros((q_np.shape[0], q_np.shape[1]*2, 3), dtype=np.uint8)
-        comp[:, :q_np.shape[1]]  = q_np
-        comp[:, q_np.shape[1]:]  = best_render_np
-        cv2.putText(comp, "query (masked)", (12,28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-        cv2.putText(comp, "refined render", (q_np.shape[1]+12,28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-        cv2.imwrite(str(output_dir / "refined_query_vs_render.png"), comp)
-
-        # full-res render (best pose)
-        with torch.no_grad():
-            R_b = torch.tensor(best_R, dtype=torch.float32, device=device)
-            t_b = torch.tensor(best_t, dtype=torch.float32, device=device)
-            proxy_best = RigidPoseGaussianProxy(gaussians, R_b, t_b)
-            _r, _, _ = _rasterize(
-                means=proxy_best.get_xyz, quats=proxy_best.get_rotation,
-                scales=proxy_best.get_scaling, opacities=proxy_best.get_opacity.squeeze(-1),
-                colors=proxy_best.get_features, viewmats=_viewmat_id, Ks=_K_mat,
-                width=int(args.width), height=int(args.height),
-                sh_degree=int(proxy_best.active_sh_degree),
-                near_plane=0.01, far_plane=100.0, backgrounds=_bg, packed=False,
-            )
-            refined_render_full_np = chw_to_bgr(_r[0].permute(2, 0, 1).clamp(0, 1))
-            cv2.imwrite(str(output_dir / "refined_render_full.png"), refined_render_full_np)
-
+        
         alpha = 0.6
         overlay_crop = cv2.addWeighted(q_np, alpha, best_render_np, 1.0 - alpha, 0)        
 
@@ -815,7 +814,7 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
             print(f"  [step7] trajectory plot failed: {_e}")
 
     pose_record = {
-        "stage": "step6",
+        "stage": "step 7",
         "model_dir":                  str(model_dir),
         "ply_path":                   str(ply_path),
         "best_iter":                  int(best_state["iter"]),
@@ -830,7 +829,6 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
     if not rt_mode:
         pose_record["outputs"] = {            
             "refined_render_full":       str(output_dir / "refined_render_full.png"),
-            "refined_query_vs_render":   str(output_dir / "refined_query_vs_render.png"),
             "refinement_curve_json":     str(output_dir / "refinement_curve.json"),
             "refined_overlay_crop_comp": str(output_dir / "refined_overlay_crop_comp.png"),
         }

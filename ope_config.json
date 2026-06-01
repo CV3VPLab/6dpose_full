@@ -1,0 +1,67 @@
+{
+    "input": {
+        "type": "dir",  
+        "name": "00001.jpg",
+        "cam_type": "femto_bolt",
+        "K_filename": "intrinsics_ds.txt"
+    },
+    "object": "can_mtdew"
+    ,
+    "detector": {
+        "name": "yolo",
+        "weights": "weights/best_3cls_v2.pt",
+        "options": {
+            "conf_thr": 0.25
+        }
+    },
+    "segmentator": {
+        "name": "sam2",
+        "weights": "weights/sam2.1_hiera_tiny.pt",
+        "options": {
+            "repo": "sam2_repo",
+            "config": "configs/sam2.1/sam2.1_hiera_t.yaml"
+        }
+        
+    },
+    "feat_extractor": {
+        "name": "DINOv2",
+        "options": {
+            "model": "dinov2_vits14",
+            "input_size": 224
+        }
+
+    },
+    "matcher": {
+        "name": "LoFTR",
+        "options": {
+            "pretrained": "outdoor",
+            "conf_thr": 0.5,
+            "input_size": 840
+        }
+    },
+    "pnp": {
+        "reproj_thr": 4.0
+    },
+    "renderer": {
+        "name": "3dgs",
+        "options": {
+            "width": 1920,
+            "height": 1080,
+            "background": [0,0,0],
+            "sh_degree": 3,
+            "iters": 100,
+            "lr_rot": 1e-2,
+            "lr_trans": 5e-3,
+            "warmup_steps": 10,
+            "early_stop_steps": 20,
+            "early_stop_thr": 1e-5
+        }
+    },
+    "comments": [
+        "input - type: [file, dir, cam]",
+        "               file: a single image file",
+        "               dir: image files in dir",
+        "               cam: image from a cam"
+    ]
+}
+

@@ -12,7 +12,7 @@ import numpy as np
 from utils.image_utils import load_bgr
 from utils.geom_utils import rotation_matrix_to_quaternion
 
-from modules_6d.io_utils import  ensure_dir, save_json, load_json, load_intrinsics, K_to_params
+from utils.io_utils import  ensure_dir, save_json, load_json, load_intrinsics, K_to_params
 
 
 

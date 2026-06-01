@@ -4,6 +4,16 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+        {   "name": "Object pose estimation",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "estimate_object_pose.py",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "args": [
+                "--config", "ope_config.json"
+            ]
+        },
         {   "name": "Step 1: Object detection & segmentation from query image",
             "type": "debugpy",
             "request": "launch",
@@ -12,7 +22,7 @@
             "cwd":"${workspaceFolder}",
             "args": [
                 "--out_dir", "data/output/can_mtdew",
-                "--query_img", "data/object/can_mtdew/query/00000.jpg",
+                "--query_img", "data/object/can_mtdew/query/00006.jpg",
                 "--yolo_weights", "weights/best_3cls_v2.pt",
                 "--sam2_checkpoint", "weights/sam2.1_hiera_tiny.pt",
                 "--sam2_repo", "sam2_repo",
@@ -53,7 +63,7 @@
             "cwd":"${workspaceFolder}",
             "args": [
                 "--stage", "step5",
-                "--query_img", "data/object/can_mtdew/query/00000.jpg",
+                "--query_img", "data/object/can_mtdew/query/00006.jpg",
                 "--out_dir", "data/output/can_mtdew",
                 "--sim_method", "dino_loftr",
                 "--dino_model", "dinov2_vits14",
@@ -80,7 +90,7 @@
                 "--gs_mode", "3dgs",
                 "--gallery_pose_json", "data/gallery_poses.json",
                 "--intrinsics_path", "data/camera/femto_bolt/intrinsics_ds.txt",
-                "--query_img", "data/object/can_mtdew/query/00000.jpg",
+                "--query_img", "data/object/can_mtdew/query/00006.jpg",
                 "--pnp_reproj_error", "4.0",
                 "--render_width", "1920",
                 "--render_height", "1080",
@@ -99,7 +109,7 @@
             "args": [
                 "--gs_model_dir",       "data/object/can_mtdew/model",
                 "--out_dir",            "data/output/can_mtdew",
-                "--query_img",          "data/object/can_mtdew/query/00000.jpg",
+                "--query_img",          "data/object/can_mtdew/query/00006.jpg",
                 "--intrinsics_path",    "data/camera/femto_bolt/intrinsics_ds.txt",
                 "--width",              "1920",
                 "--height",             "1080",

@@ -8,7 +8,7 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
-from .io_utils import ensure_dir, load_image, save_json
+from utils.io_utils import ensure_dir, load_image, save_json
 from utils.image_utils import expand_bbox, crop_with_bbox, compute_bbox, apply_mask
 from .manual_bbox import select_bbox_opencv
 from .viz_utils import draw_bbox, make_mask_overlay

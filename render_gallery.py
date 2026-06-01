@@ -402,7 +402,7 @@ def extract_dino_features(args, gallery_bboxes):
     for idx in tqdm(range(len(gallery_bboxes)), desc="DINO feature extraction"):
         img_rgb_crop = load_rgb(render_dir / f"{idx:04d}.png")
         assert gallery_bboxes[idx][2] - gallery_bboxes[idx][0] == img_rgb_crop.shape[1] and gallery_bboxes[idx][3] - gallery_bboxes[idx][1] == img_rgb_crop.shape[0], f"Crop size mismatch: expected ({gallery_bboxes[idx][2] - gallery_bboxes[idx][0]}, {gallery_bboxes[idx][3] - gallery_bboxes[idx][1]}), got {img_rgb_crop.shape[1]}, {img_rgb_crop.shape[0]}"
-        gallery_crop = zeropad_square(img_rgb_crop, bbox_size)
+        gallery_crop, _ = zeropad_square(img_rgb_crop, bbox_size)
         
         # 4 tiles of DINO input, each tile gets a quarter of the original bbox crop (with some shared margin)
         gallery_crop_dino = square_pad_resize(gallery_crop, dino_in_size * 2)  

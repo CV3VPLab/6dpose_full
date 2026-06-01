@@ -13,6 +13,8 @@ import torch
 import cv2
 import numpy as np
 from pathlib import Path
+from tqdm import tqdm
+from .io_utils import load_json
 
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
@@ -109,11 +111,13 @@ def zeropad_square(img, side):
     assert h <= side and w <= side, "Image dimensions should be less than or equal to the specified side length"
     
     canvas = np.zeros((side, side, 3), dtype=np.uint8)
+    if not isinstance(side, np.ndarray):
+        side = np.array(side)
     pad_hw = side - img.shape[:2]
     sy, sx = pad_hw // 2
     ey, ex = img.shape[0] + sy, img.shape[1] + sx
     canvas[sy:ey, sx:ex] = img
-    return canvas
+    return canvas, (sx, sy)
 
 
 def unmap_from_square_resize(pts_resized, orig_hw, resize_target):
@@ -136,6 +140,22 @@ def apply_mask(image, mask):
     out = np.zeros_like(image)
     out[mask > 0] = image[mask > 0]
     return out
+
+
+def get_mask_inlier_indices(pts, mask):
+    """
+    원본 좌표가 마스크 내부에 있는지 확인하여 True/False 리스트 반환
+    """
+    h, w = mask.shape
+    keep_mask = []
+    for pt in pts:
+        x, y = int(round(pt[0])), int(round(pt[1]))
+        if 0 <= x < w and 0 <= y < h and mask[y, x] > 0:
+            keep_mask.append(True)
+        else:
+            keep_mask.append(False)
+            
+    return np.array(keep_mask)
 
 
 def load_rgb(path):
@@ -171,11 +191,11 @@ def construct_queryInfo(query_img, out_dir):
     print(f"  query bbox: {q_bbox}, (width={q_bbox[2]-q_bbox[0]}, height={q_bbox[3]-q_bbox[1]})")
 
     return {
-        "query_full": query_full,   # full query image (RGB)
-                                    # KSCHOI TODO: currently, masked query image is used as full image, 
-                                    # but ideally should be original unmasked RGB query
-        "query_mask": mask,         # full query mask (grayscale, 0=background, 255=foreground)
-        "q_bbox": q_bbox            # query bounding box
+        "rgb": query_full,      # full query image (RGB)
+                                # KSCHOI TODO: currently, masked query image is used as full image, 
+                                # but ideally should be original unmasked RGB query
+        "mask": mask,           # full query mask (grayscale, 0=background, 255=foreground)
+        "bbox": q_bbox          # query bounding box
     }
 
 
@@ -187,17 +207,37 @@ def construct_galleryInfo(out_dir):
     print(f"  DINOv2 cache dir: {out_dir}")
 
     gallery_feats = np.load( str(out_dir / "g_features.npy") )
-    gfeats = torch.from_numpy(gallery_feats) # (N_gallery, D_feat) tensor
+    g_feats = torch.from_numpy(gallery_feats) # (N_gallery, D_feat) tensor
 
     # Cropped gallery images load
     gallery_crops = []
-    for idx in range(len(g_bboxes)):
+    for idx in tqdm(range(len(g_bboxes)), desc="Loading gallery"):
         gpath = out_dir / "gallery" / f"{idx:04d}.png"
         img_rgb = load_rgb(str(gpath))
         gallery_crops.append(img_rgb)
 
+    bbox_size = get_max_bbox_size(g_bboxes)
+
+    gallery_poses = load_json(out_dir.parent.parent / "gallery_poses.json")["poses"]
+
     return {
-        "gallery_crops": gallery_crops, # cropped gallery images according to g_bboxes
-        "g_bboxes": g_bboxes,           # all the bounding boxes of gallery renders
-        "gfeats": gfeats                # DINOv2 features of gallery crops, used for cosine similarity retrieval  
+        "crops": gallery_crops,         # cropped gallery images according to g_bboxes
+        "poses": gallery_poses,
+        "bboxes": g_bboxes,             # all the bounding boxes of gallery renders
+        "bbox_size": bbox_size,         # the union bounding box
+        "feats": g_feats,               # DINOv2 features of gallery crops, used for cosine similarity retrieval 
+        "path": out_dir / "gallery" 
     }
+
+
+def make_gallery_square(galleryInfo, idx, size):
+    g_bbox = galleryInfo["bboxes"][idx]
+    gallery_crop = galleryInfo["crops"][idx]
+    g_crop_hw = gallery_crop.shape[:2]
+    assert g_bbox[2] - g_bbox[0] == g_crop_hw[1] and g_bbox[3] - g_bbox[1] == g_crop_hw[0], f"Gallery crop size mismatch with bbox, check loading and cropping logic for gallery item {item}"
+    assert size >= g_crop_hw[0] and size >= g_crop_hw[1]
+
+    g_crop_ext, scoord = zeropad_square(gallery_crop, size)
+    g_bbox_ext = g_bbox[:2] - scoord
+    g_bbox_ext = np.array( list(g_bbox_ext) + list(g_bbox_ext + size) )
+    return g_crop_ext, g_bbox_ext

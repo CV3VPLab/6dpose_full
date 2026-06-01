@@ -17,7 +17,7 @@ from .retrieval_dino import (
     DinoV2Extractor
 )
 
-from modules_6d.io_utils import (
+from utils.io_utils import (
     ensure_dir
 )
 from utils.image_utils import (
@@ -27,6 +27,7 @@ from utils.image_utils import (
     square_pad_resize,
     zeropad_square,
     unmap_to_full_image,
+    get_mask_inlier_indices,
     construct_queryInfo,
     construct_galleryInfo
 )
@@ -56,20 +57,7 @@ def compute_loftr_matches(matcher, img0_bgr, img1_bgr, device="cuda"):
     return mkpts0, mkpts1, conf
 
 
-def get_mask_inlier_indices(pts, mask):
-    """
-    원본 좌표가 마스크 내부에 있는지 확인하여 True/False 리스트 반환
-    """
-    h, w = mask.shape
-    keep_mask = []
-    for pt in pts:
-        x, y = int(round(pt[0])), int(round(pt[1]))
-        if 0 <= x < w and 0 <= y < h and mask[y, x] > 0:
-            keep_mask.append(True)
-        else:
-            keep_mask.append(False)
-            
-    return np.array(keep_mask)
+
 
 
 def draw_loftr_matches(img0, img1, mkpts0, mkpts1, conf, out_path, max_draw=400):
@@ -93,7 +81,10 @@ def draw_loftr_matches(img0, img1, mkpts0, mkpts1, conf, out_path, max_draw=400)
         cv2.circle(canvas, p0, 2, (0, 255, 255), -1)
         cv2.circle(canvas, p1, 2, (0, 255, 255), -1)
 
-    cv2.imwrite(str(out_path), canvas)
+    if out_path is not None:
+        cv2.imwrite(str(out_path), canvas)
+
+    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
 
 
 def save_best_match_data(
@@ -188,13 +179,13 @@ def retrieve_topk(query, query_mask, q_bbox, g_bbox_size, gfeats, extractor, din
 
 def retrieve_match(query_info, gallery_info, feat_extractor_info, matcher_info, out_dir=None):
     # KSCHOI TODO: occlusion 상황에서 topk가 의미 있는지 확인 (현재는 DINO feature similarity top-1만 사용함)
-    query = query_info["query_full"]
-    query_mask = query_info["query_mask"]
-    q_bbox = query_info["q_bbox"]
+    query = query_info["rgb"]
+    query_mask = query_info["mask"]
+    q_bbox = query_info["bbox"]
     
-    gallery_crops = gallery_info["gallery_crops"]
-    g_bboxes = gallery_info["g_bboxes"]
-    gfeats = gallery_info["gfeats"]
+    gallery_crops = gallery_info["crops"]
+    g_bboxes = gallery_info["bboxes"]
+    gfeats = gallery_info["feats"]
 
     extractor = feat_extractor_info["extractor"]
     dino_size = feat_extractor_info["input_size"]
@@ -223,7 +214,7 @@ def retrieve_match(query_info, gallery_info, feat_extractor_info, matcher_info, 
     g_crop_hw = gallery_crops[item].shape[:2]
     assert g_bbox[2] - g_bbox[0] == g_crop_hw[1] and g_bbox[3] - g_bbox[1] == g_crop_hw[0], f"Gallery crop size mismatch with bbox, check loading and cropping logic for gallery item {item}"
 
-    gallery_crop = zeropad_square(gallery_crops[item], bbox_size)
+    gallery_crop, _ = zeropad_square(gallery_crops[item], bbox_size)
 
     # ── LoFTR rerank ───────────────────────────────────────────────────────
     LOFTR_SIZE = 840
@@ -284,13 +275,13 @@ def  run_step5_dino_loftr_rerank(args):
     # Data ::
     #######################################################
     query_info = construct_queryInfo(args.query_img, out_dir)
-    #     "query_full": query_full,       # full query image (RGB)
-    #     "query_mask": mask,             # full query mask (grayscale, 0=background, 255=foreground)
-    #     "q_bbox": q_bbox                # query bounding box
+    #     "rgb": query_full,       # full query image (RGB)
+    #     "mask": mask,             # full query mask (grayscale, 0=background, 255=foreground)
+    #     "bbox": q_bbox                # query bounding box
     gallery_info = construct_galleryInfo(out_dir)
-    #     "gallery_crops": gallery_crops, # cropped gallery images according to g_bboxes
-    #     "g_bboxes": g_bboxes,           # all the bounding boxes of gallery renders
-    #     "gfeats": gfeats                # DINOv2 features of gallery crops, used for cosine similarity retrieval  
+    #     "crops": gallery_crops, # cropped gallery images according to g_bboxes
+    #     "bboxes": g_bboxes,           # all the bounding boxes of gallery renders
+    #     "feats": g_feats              # DINOv2 features of gallery crops, used for cosine similarity retrieval  
     
     #######################################################
     # Inputs for LoFTR reranking
