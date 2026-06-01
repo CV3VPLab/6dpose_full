@@ -18,9 +18,10 @@ import time
 
 from utils.io_utils import load_json, load_intrinsics, K_to_params, resolve_ply_path 
 from utils.image_utils import (
-    load_rgb, 
+    load_rgb, render_to_image, compute_nonblack_bbox,
     expand_bbox, compute_bbox, get_bbox_size, square_bbox, crop_with_bbox, square_pad_resize, unmap_to_full_image, 
-    make_gallery_square, construct_galleryInfo, apply_mask, get_mask_inlier_indices
+    make_gallery_square, construct_galleryInfo, 
+    apply_mask, get_mask_inlier_indices
 )
 from gaussian_renderer import GaussianModel
 
@@ -134,6 +135,32 @@ def get_obj_path(obj_name, kind):
 
 def get_K_path(config):
     return Path("data/camera") / config["cam_type"] / config["K_filename"]
+
+
+def make_comp_image(query, gaussian_proxy, q_bbox):
+    q_crop = crop_with_bbox(query, q_bbox)
+
+    _r, _, _ = gaussian_proxy.render(width = query.shape[1], height = query.shape[0])
+    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
+    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
+    contours, _ = cv2.findContours( (gray > 10).astype(np.uint8) * 255, 
+                                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
+    q_crop1 = q_crop.copy()
+    cv2.drawContours(q_crop1, contours, -1, (0,255,0), 1)
+
+    q_w = q_crop.shape[1]
+    alpha = 0.6
+    overlay_crop = cv2.addWeighted(q_crop, alpha, r_crop, 1.0 - alpha, 0)
+    res_img = np.zeros((q_crop.shape[0], q_crop.shape[1] * 4, 3), dtype=np.uint8)
+    res_img[:, :q_w] = q_crop
+    res_img[:, q_w:q_w*2] = r_crop
+    res_img[:, q_w*2:q_w*3] = overlay_crop
+    res_img[:, q_w*3:] = q_crop1
+    cv2.putText(res_img, "Query",   (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    cv2.putText(res_img, "Render",  (q_w + 12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    cv2.putText(res_img, "Overlay", (q_w*2 + 12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    cv2.putText(res_img, "Query+Render contours",   (q_w*3 + 12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    return res_img
 
 
 # processes
@@ -307,15 +334,8 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, K, options):
 
         # full resolution render with identity cam (gsplat)
         gProxy.set_T(R_cur, t_cur)
-        _r, _, _ = _rasterize(
-            means = gProxy.get_xyz, quats=gProxy.get_rotation,
-            scales = gProxy.get_scaling, opacities=gProxy.get_opacity.squeeze(-1),
-            colors = gProxy.get_features, viewmats=gProxy.viewmat, Ks=gProxy.K_mat,
-            width = options["width"], height=options["height"],
-            sh_degree = int(gProxy.active_sh_degree),
-            near_plane=0.01, far_plane=100.0, backgrounds=gProxy.bg, packed=False,
-        )
-
+        _r, _, _ = gProxy.render(width = options["width"], height=options["height"])
+        
         render_full = _r[0].permute(2, 0, 1).clamp(0, 1)
         render_crop = crop_chw_with_bbox(render_full, bbox_fixed)
 
@@ -382,29 +402,8 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, K, options):
     best_t = best_state["t"].cpu().numpy().copy()
     
     return best_R, best_t, best_state["track_loss"], bbox_fixed
-    # if True: #not rt_mode:
-    #     # side-by-side
-    #     q_np = cv2.cvtColor(
-    #         (query_crop.cpu().permute(1,2,0).numpy()*255).clip(0,255).astype(np.uint8),
-    #         cv2.COLOR_RGB2BGR)
-        
-    #     alpha = 0.6
-    #     overlay_crop = cv2.addWeighted(q_np, alpha, best_render_np, 1.0 - alpha, 0)        
-
-    #     comp_overlay = np.zeros((q_np.shape[0], q_np.shape[1] * 3, 3), dtype=np.uint8)
-    #     comp_overlay[:, :q_np.shape[1]] = q_np
-    #     comp_overlay[:, q_np.shape[1]:q_np.shape[1]*2] = best_render_np
-    #     comp_overlay[:, q_np.shape[1]*2:] = overlay_crop
-    #     cv2.putText(comp_overlay, "Query",   (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-    #     cv2.putText(comp_overlay, "Render",  (q_np.shape[1] + 12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-    #     cv2.putText(comp_overlay, "Overlay", (q_np.shape[1]*2 + 12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-    #     cv2.imwrite(str(output_dir / "refined_overlay_crop_comp.png"), comp_overlay)
-
-    #     save_json(output_dir / "refinement_curve.json", {"iters": args.iters, "losses": losses})
-
     
-
-
+    
 def estimate_object_pose(query, gallery_info, nets, gProxy:RigidPoseGaussianProxy, K, pnp_option, render_options):
     query_bgr = cv2.cvtColor(query, cv2.COLOR_RGB2BGR)
     q_mask = detect_segment(query_bgr, nets[:2])
@@ -425,8 +424,7 @@ def estimate_object_pose(query, gallery_info, nets, gProxy:RigidPoseGaussianProx
     R, t, t_loss, bbox = refine_pose(query_info, gProxy, K, render_options)
     print(f"R: {R} \nt: {t*100}(cm) \ntracking loss: {t_loss}")
 
-    return R, t, t_loss
-
+    return R, t, t_loss, bbox
     
 
 def main_object_pose_estimation():
@@ -465,10 +463,17 @@ def main_object_pose_estimation():
         # time measurement
         st = time.perf_counter()
         
-        R, t, t_loss = estimate_object_pose(query, gallery_info, nets, gaussian_proxy, K, pnp_option, render_options)
+        R, t, t_loss, q_bbox = estimate_object_pose(query, gallery_info, nets, gaussian_proxy, K, pnp_option, render_options)
         
         et = time.perf_counter()
         performance.append((et - st, t_loss))
+
+        # Visualization
+        gaussian_proxy.set_T(R, t)
+        comp_img = make_comp_image(query, gaussian_proxy, q_bbox)
+        vis_path = obj_out_dir / "result" / f"{query_paths[i].stem}_comp.png"
+        vis_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(vis_path), cv2.cvtColor(comp_img, cv2.COLOR_RGB2BGR))
 
     print("\n=== Performance Summary ===")
     print(f"pose estimation time: {np.mean([p[0] for p in performance]):.6f} seconds")
@@ -477,3 +482,11 @@ def main_object_pose_estimation():
 
 if __name__ == "__main__":
     main_object_pose_estimation()
+
+
+
+    
+    
+    
+
+    

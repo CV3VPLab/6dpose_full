@@ -241,3 +241,7 @@ def make_gallery_square(galleryInfo, idx, size):
     g_bbox_ext = g_bbox[:2] - scoord
     g_bbox_ext = np.array( list(g_bbox_ext) + list(g_bbox_ext + size) )
     return g_crop_ext, g_bbox_ext
+
+
+def render_to_image(render):
+    return (render.clamp(0, 1).detach().cpu().numpy() * 255.0).astype(np.uint8)

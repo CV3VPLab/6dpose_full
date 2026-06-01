@@ -422,6 +422,16 @@ class RigidPoseGaussianProxy:
 
     def toGPUTensor(self, arr):
         return torch.tensor(arr.astype(np.float32), dtype=torch.float32, device='cuda')
+    
+    def render(self, width=1920, height=1080):
+        return _rasterize(
+            means = self.get_xyz, quats=self.get_rotation,
+            scales = self.get_scaling, opacities=self.get_opacity.squeeze(-1),
+            colors = self.get_features, viewmats=self.viewmat, Ks=self.K_mat,
+            width = width, height = height,
+            sh_degree = int(self.active_sh_degree),
+            near_plane=0.01, far_plane=100.0, backgrounds=self.bg, packed=False
+        )
 
 
 # ──────────────────────────────────────────────────────────
