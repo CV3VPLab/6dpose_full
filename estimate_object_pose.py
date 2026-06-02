@@ -1,22 +1,23 @@
 import numpy as np
 import cv2
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from pathlib import Path
 from modules_6d.yolo_sam import load_yolo_model, detect_with_yolo, load_sam2_predictor, segment_from_bbox
 from modules_6d.retrieval_dino import DinoV2Extractor
 from modules_6d.retrieval_dino_loftr import compute_loftr_matches, draw_loftr_matches
-from modules_6d.step6_translation import get_initial_pose, get_gallery_pose
+from modules_6d.step6_translation import get_initial_pose, get_gallery_pose, project_axes_overlay
 from refine_pose import (
     RigidPoseGaussianProxy, CosineWarmupScheduler, 
-    dssim_loss, dms_ssim_loss, chw_to_bgr,
-    _rasterize, so3_exp_map, crop_chw_with_bbox
+    dssim_loss, dms_ssim_loss, 
+    so3_exp_map, crop_chw_with_bbox
 )
 from tqdm import tqdm
 import time
 
-from utils.io_utils import load_json, load_intrinsics, K_to_params, resolve_ply_path 
+from utils.io_utils import load_json, load_intrinsics, resolve_ply_path 
 from utils.image_utils import (
     load_rgb, render_to_image, compute_nonblack_bbox,
     expand_bbox, compute_bbox, get_bbox_size, square_bbox, crop_with_bbox, square_pad_resize, unmap_to_full_image, 
@@ -25,7 +26,33 @@ from utils.image_utils import (
 )
 from gaussian_renderer import GaussianModel
 
+class ECCLoss(nn.Module):
+    def __init__(self, eps=1e-8):
+        super(ECCLoss, self).__init__()
+        self.eps = eps # 0으로 나누어지는 것을 방지하기 위한 작은 값
 
+    def forward(self, img1, img2):
+        """
+        img1, img2: (B, C, H, W) 형태의 텐서
+        """
+        # 1. 각 이미지의 공간 차원(H, W)에 대한 평균을 구하고 빼줍니다 (Zero-mean)
+        img1_mean = img1 - torch.mean(img1, dim=[-2, -1], keepdim=True)
+        img2_mean = img2 - torch.mean(img2, dim=[-2, -1], keepdim=True)
+
+        # 2. 분자: 두 이미지의 공분산 (Covariance)
+        cov = torch.mean(img1_mean * img2_mean, dim=[-2, -1], keepdim=True)
+
+        # 3. 분모: 각 이미지의 표준편차 (Standard Deviation)
+        std1 = torch.std(img1_mean, dim=[-2, -1], keepdim=True)
+        std2 = torch.std(img2_mean, dim=[-2, -1], keepdim=True)
+
+        # 4. 정규화된 교차 상관계수 (ECC)
+        ecc = cov / (std1 * std2 + self.eps)
+
+        # 5. Loss 구성 (1 - ECC) 및 배치 전체 평균 반환
+        loss = 1.0 - ecc
+        return loss.mean()
+    
 
 def init_gaussians(config, ply_path):
     options = config["options"]
@@ -137,7 +164,24 @@ def get_K_path(config):
     return Path("data/camera") / config["cam_type"] / config["K_filename"]
 
 
-def make_comp_image(query, gaussian_proxy, q_bbox):
+def project_obj_axes(K, R, t, axis_len_m=0.1):
+    obj_pts = np.array([
+        [0, 0, 0],
+        [axis_len_m, 0, 0],
+        [0, axis_len_m, 0],
+        [0, 0, axis_len_m],
+    ], dtype=np.float32)
+
+    rvec, _ = cv2.Rodrigues(R.astype(np.float64))
+    tvec = t.reshape(3, 1).astype(np.float64)
+    dist = np.zeros((4, 1), dtype=np.float64)
+    imgpts, _ = cv2.projectPoints(obj_pts, rvec, tvec, K.astype(np.float64), dist)
+    imgpts = np.round(imgpts.reshape(-1, 2)).astype(int)
+
+    return imgpts
+
+
+def make_comp_image(query, gaussian_proxy:RigidPoseGaussianProxy, q_bbox):
     q_crop = crop_with_bbox(query, q_bbox)
 
     _r, _, _ = gaussian_proxy.render(width = query.shape[1], height = query.shape[0])
@@ -148,6 +192,18 @@ def make_comp_image(query, gaussian_proxy, q_bbox):
     q_crop1 = q_crop.copy()
     cv2.drawContours(q_crop1, contours, -1, (0,255,0), 1)
 
+    R, t = gaussian_proxy.get_T()
+    R_np = R.cpu().numpy()
+    t_np = t.cpu().numpy()
+    K = gaussian_proxy.K_mat.cpu().numpy()[0]
+    imgpts = project_obj_axes(K, R_np, t_np, 0.06)
+    imgpts = imgpts - q_bbox[:2]
+    o = tuple(imgpts[0])
+    cv2.line(q_crop1, o, tuple(imgpts[1]), (255, 0, 0), 2, cv2.LINE_AA)
+    cv2.line(q_crop1, o, tuple(imgpts[2]), (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.line(q_crop1, o, tuple(imgpts[3]), (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.circle(q_crop1, o, 6, (255, 255, 255), -1, cv2.LINE_AA)
+    
     q_w = q_crop.shape[1]
     alpha = 0.6
     overlay_crop = cv2.addWeighted(q_crop, alpha, r_crop, 1.0 - alpha, 0)
@@ -274,7 +330,7 @@ def get_T0(query_info, gallery_info, nets, K, reproj_thr):
     return R0, t0
 
 
-def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, K, options):
+def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, options):
     device = 'cuda'
     
     # query bounding box 
@@ -296,8 +352,8 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, K, options):
     # ──────────────────────────────────────────────────────
     # 4. Optimization
     # ──────────────────────────────────────────────────────
-    delta_r = torch.zeros(3, device=device, dtype=torch.float32, requires_grad=True)
-    delta_t = torch.zeros(3, device=device, dtype=torch.float32, requires_grad=True)
+    delta_r = torch.zeros(3, device=device, dtype=torch.float32, requires_grad=True)    # rodrigues vector for rotation update
+    delta_t = torch.zeros(3, device=device, dtype=torch.float32, requires_grad=True)    # translation update
 
     optimizer = torch.optim.AdamW([
         {"params": [delta_r], "lr": options["lr_rot"]},
@@ -320,6 +376,8 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, K, options):
         "iter": 0,
     }
 
+    ecc_loss_fn = ECCLoss()
+
     for it in range(options["iters"]):
         optimizer.zero_grad()
 
@@ -328,9 +386,7 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, K, options):
         # tz clamp: init_t의 ±40% 범위로 제한 (frustum 이탈 방지)
         t0z = float(t0[2].item())
         t_raw = t0 + delta_t
-        t_cur = torch.stack([t_raw[0], t_raw[1],
-            torch.clamp(t_raw[2], min=t0z * 0.6, max=t0z * 1.4)
-        ])
+        t_cur = torch.stack( [t_raw[0],  t_raw[1],  torch.clamp(t_raw[2], min=t0z*0.6, max=t0z*1.4)] )
 
         # full resolution render with identity cam (gsplat)
         gProxy.set_T(R_cur, t_cur)
@@ -339,30 +395,43 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, K, options):
         render_full = _r[0].permute(2, 0, 1).clamp(0, 1)
         render_crop = crop_chw_with_bbox(render_full, bbox_fixed)
 
-        # 현재 학습 진행도 (0.0 ~ 1.0)
-        progress = it / max(1, options["iters"])
-
         # 1. Silhouette (Mask) Loss
-        render_alpha = (render_crop.sum(dim=0, keepdim=True) > 0.05).float()
+        masked_render_crop = render_crop * query_mask.unsqueeze(0)
+        render_alpha = (masked_render_crop.sum(dim=0, keepdim=True) > 0.05).float()
         loss_mask = F.l1_loss(render_alpha, query_mask)
 
         # 2. RGB Loss (SSIM, L1)
-        loss_ssim = dssim_loss(render_crop, query_crop) + dms_ssim_loss(render_crop, query_crop)
-        loss_l1_rgb = F.l1_loss(render_crop, query_crop)
+        loss_ssim = dssim_loss(masked_render_crop, query_crop) + dms_ssim_loss(masked_render_crop, query_crop)
+        loss_l1_rgb = F.l1_loss(masked_render_crop, query_crop)
 
         # 3. Blur Loss
         blur_target = F.avg_pool2d(query_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
-        blur_render = F.avg_pool2d(render_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
+        blur_render = F.avg_pool2d(masked_render_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
         loss_blur = F.l1_loss(blur_render, blur_target)
+
+        ecc_loss = ecc_loss_fn(masked_render_crop.unsqueeze(0), query_crop.unsqueeze(0))
+
+        # render_alpha = (render_crop.sum(dim=0, keepdim=True) > 0.05).float()
+        # loss_mask = F.l1_loss(render_alpha, query_mask)
+
+        # # 2. RGB Loss (SSIM, L1)
+        # loss_ssim = dssim_loss(render_crop, query_crop) + dms_ssim_loss(render_crop, query_crop)
+        # loss_l1_rgb = F.l1_loss(render_crop, query_crop)
+
+        # # 3. Blur Loss
+        # blur_target = F.avg_pool2d(query_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
+        # blur_render = F.avg_pool2d(render_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
+        # loss_blur = F.l1_loss(blur_render, blur_target)
 
         # 4. [핵심] Dynamic Weighting (Coarse-to-Fine)
         # 초반: Blur 중심 (크게 돌리기) / 후반: SSIM 중심 (칼같이 맞추기)
-        weight_blur = 1.0 * (1.0 - progress)  # 1.0에서 0.0으로 서서히 감소
-        weight_ssim = 0.1 + 0.9 * progress    # 0.1에서 1.0으로 서서히 증가
-        weight_l1   = 0.5                     # 기본 위치 유지를 위해 고정
-        weight_mask = 1.0                     # 크기 유지를 위해 고정
+        progress = it / max(1, options["iters"])    # 현재 학습 진행도 (0.0 ~ 1.0)
+        weight_blur = 1.0 * (1.0 - progress)        # 1.0에서 0.0으로 서서히 감소
+        weight_ssim = 0.1 + 0.9 * progress          # 0.1에서 1.0으로 서서히 증가
+        weight_l1   = 0.5                           # 기본 위치 유지를 위해 고정ge
+        weight_mask = 1.0                           # 크기 유지를 위해 고정
 
-        loss = (weight_ssim * loss_ssim) + (weight_l1 * loss_l1_rgb) + (weight_blur * loss_blur) + (weight_mask * loss_mask)
+        loss = (weight_blur * loss_blur) + ecc_loss + (weight_mask * loss_mask) # (weight_ssim * loss_ssim) + (weight_l1 * loss_l1_rgb) +
 
         loss.backward()
 
@@ -421,7 +490,7 @@ def estimate_object_pose(query, gallery_info, nets, gProxy:RigidPoseGaussianProx
 
     # Render & Compare
     gProxy.set_T(R0, t0)
-    R, t, t_loss, bbox = refine_pose(query_info, gProxy, K, render_options)
+    R, t, t_loss, bbox = refine_pose(query_info, gProxy, render_options)
     print(f"R: {R} \nt: {t*100}(cm) \ntracking loss: {t_loss}")
 
     return R, t, t_loss, bbox
