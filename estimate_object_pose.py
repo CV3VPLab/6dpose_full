@@ -1,13 +1,42 @@
+import locale
+import os
 import numpy as np
 import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
+try:
+    locale.setlocale(locale.LC_CTYPE, "C.UTF-8")
+except locale.Error:
+    pass
+
+try:
+    import torch.utils._cpp_extension_versioner as _torch_ext_versioner
+
+    def _hash_source_files_utf8(hash_value, source_files):
+        for filename in source_files:
+            with open(filename, encoding="utf-8", errors="ignore") as file:
+                hash_value = _torch_ext_versioner.update_hash(hash_value, file.read())
+        return hash_value
+
+    _torch_ext_versioner.hash_source_files = _hash_source_files_utf8
+except Exception:
+    pass
+
 from pathlib import Path
 from modules_6d.yolo_sam import load_yolo_model, detect_with_yolo, load_sam2_predictor, segment_from_bbox
-from modules_6d.retrieval_dino import DinoV2Extractor
+from modules_6d.retrieval_dino import DinoV2Extractor, DinoV2ExtractorTRT, load_dino_trt_session
 from modules_6d.retrieval_dino_loftr import compute_loftr_matches, draw_loftr_matches
+from modules_6d.retrieval_edm import (
+    compute_edm_matches,
+    compute_edm_trt_matches,
+    load_edm_model,
+    load_edm_trt_session,
+    warmup_edm_trt_session,
+)
 from modules_6d.step6_translation import get_initial_pose, get_gallery_pose, project_axes_overlay
 from refine_pose import (
     RigidPoseGaussianProxy, CosineWarmupScheduler, 
@@ -25,6 +54,12 @@ from utils.image_utils import (
     apply_mask, get_mask_inlier_indices
 )
 from gaussian_renderer import GaussianModel
+
+
+def sync_time():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
 
 class ECCLoss(nn.Module):
     def __init__(self, eps=1e-8):
@@ -90,15 +125,58 @@ def load_extractor(config):
     assert config["name"] == "DINOv2"
 
     options = config['options']
+    if options.get("onnx"):
+        sess = load_dino_trt_session(
+            options["onnx"],
+            trt_cache_dir=options.get("trt_cache_dir"),
+            require_gpu=options.get("require_gpu", True),
+        )
+        extractor = DinoV2ExtractorTRT(options["model"], sess)
+        if options.get("warmup", True):
+            t0 = sync_time()
+            dummy_rgb = np.zeros((int(options.get("input_size", 224)), int(options.get("input_size", 224)), 3), dtype=np.uint8)
+            for _ in range(int(options.get("warmup_runs", 1))):
+                extractor.encode_rgb(dummy_rgb)
+            t1 = sync_time()
+            print(f"  [DINO TRT] Warmup done ({(t1 - t0):.3f}s, runs={options.get('warmup_runs', 1)})")
+        return extractor, options
+
     return DinoV2Extractor(options["model"], device='cuda'), options
 
 
 def load_matcher(config):
-    assert config["name"] == "LoFTR"
-
+    name = config["name"]
     options = config['options']
-    import kornia.feature as KF
-    return KF.LoFTR(pretrained=options["pretrained"]).to('cuda').eval(), options
+
+    if name == "LoFTR":
+        import kornia.feature as KF
+        model = KF.LoFTR(pretrained=options["pretrained"]).to('cuda').eval()
+        return {"name": name, "model": model, "options": options}
+
+    if name == "EDM":
+        model = load_edm_model(
+            edm_repo=config["repo"],
+            ckpt_path=config["weights"],
+            device="cuda",
+        )
+        return {"name": name, "model": model, "options": options}
+
+    if name == "EDM_TRT":
+        model = load_edm_trt_session(
+            onnx_path=config["onnx"],
+            trt_cache_dir=config.get("trt_cache_dir"),
+            require_gpu=options.get("require_gpu", True),
+        )
+        if options.get("warmup", True):
+            input_size = int(options["input_size"])
+            n_runs = int(options.get("warmup_runs", 1))
+            t0 = sync_time()
+            warmup_edm_trt_session(model, input_size, input_size, n_runs=n_runs)
+            t1 = sync_time()
+            print(f"  [EDM TRT] Warmup done ({(t1 - t0):.3f}s, runs={n_runs})")
+        return {"name": name, "model": model, "options": options}
+
+    raise ValueError(f"Unsupported matcher: {name}")
 
 
 def load_networks(config):
@@ -170,6 +248,9 @@ def project_obj_axes(K, R, t, axis_len_m=0.1):
         [axis_len_m, 0, 0],
         [0, axis_len_m, 0],
         [0, 0, axis_len_m],
+        [-axis_len_m, 0, 0],
+        [0, -axis_len_m, 0],
+        [0, 0, -axis_len_m],
     ], dtype=np.float32)
 
     rvec, _ = cv2.Rodrigues(R.astype(np.float64))
@@ -189,9 +270,7 @@ def make_comp_image(query, gaussian_proxy:RigidPoseGaussianProxy, q_bbox):
     gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
     contours, _ = cv2.findContours( (gray > 10).astype(np.uint8) * 255, 
                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
-    q_crop1 = q_crop.copy()
-    cv2.drawContours(q_crop1, contours, -1, (0,255,0), 1)
-
+    q_crop_annotation = q_crop.copy()
     R, t = gaussian_proxy.get_T()
     R_np = R.cpu().numpy()
     t_np = t.cpu().numpy()
@@ -199,10 +278,14 @@ def make_comp_image(query, gaussian_proxy:RigidPoseGaussianProxy, q_bbox):
     imgpts = project_obj_axes(K, R_np, t_np, 0.06)
     imgpts = imgpts - q_bbox[:2]
     o = tuple(imgpts[0])
-    cv2.line(q_crop1, o, tuple(imgpts[1]), (255, 0, 0), 2, cv2.LINE_AA)
-    cv2.line(q_crop1, o, tuple(imgpts[2]), (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.line(q_crop1, o, tuple(imgpts[3]), (0, 0, 255), 2, cv2.LINE_AA)
-    cv2.circle(q_crop1, o, 6, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.line(q_crop_annotation, o, tuple(imgpts[1]), (255, 0, 0), 2, cv2.LINE_AA)
+    cv2.line(q_crop_annotation, o, tuple(imgpts[2]), (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.line(q_crop_annotation, o, tuple(imgpts[3]), (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.line(q_crop_annotation, o, tuple(imgpts[4]), (255, 0, 0), 1, cv2.LINE_AA)
+    cv2.line(q_crop_annotation, o, tuple(imgpts[5]), (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.line(q_crop_annotation, o, tuple(imgpts[6]), (0, 0, 255), 1, cv2.LINE_AA)
+    cv2.circle(q_crop_annotation, o, 6, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.drawContours(q_crop_annotation, contours, -1, (0,255,0), 1)
     
     q_w = q_crop.shape[1]
     alpha = 0.6
@@ -211,7 +294,7 @@ def make_comp_image(query, gaussian_proxy:RigidPoseGaussianProxy, q_bbox):
     res_img[:, :q_w] = q_crop
     res_img[:, q_w:q_w*2] = r_crop
     res_img[:, q_w*2:q_w*3] = overlay_crop
-    res_img[:, q_w*3:] = q_crop1
+    res_img[:, q_w*3:] = q_crop_annotation
     cv2.putText(res_img, "Query",   (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
     cv2.putText(res_img, "Render",  (q_w + 12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
     cv2.putText(res_img, "Overlay", (q_w*2 + 12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
@@ -262,18 +345,33 @@ def retrieve_best(queryInfo, galleryInfo, extractor):
 
 
 def compute_matches(query, gallery, matcher):
-    match_net = matcher[0]
-    match_opts = matcher[1]
+    match_name = matcher["name"]
+    match_net = matcher["model"]
+    match_opts = matcher["options"]
     in_size = match_opts["input_size"]
     conf_thr = match_opts["conf_thr"]
     
-    query_l = square_pad_resize(query, in_size)
-    gallery_l = square_pad_resize(gallery, in_size)
+    query_m = square_pad_resize(query, in_size)
+    gallery_m = square_pad_resize(gallery, in_size)
     
-    mkpts0, mkpts1, conf = compute_loftr_matches(match_net, query_l, gallery_l, device="cuda")
-    
+    if match_name == "LoFTR":
+        mkpts0, mkpts1, conf = compute_loftr_matches(match_net, query_m, gallery_m, device="cuda")
+    elif match_name == "EDM":
+        mkpts0, mkpts1, conf = compute_edm_matches(match_net, query_m, gallery_m, device="cuda")
+    elif match_name == "EDM_TRT":
+        mkpts0, mkpts1, conf = compute_edm_trt_matches(
+            match_net,
+            query_m,
+            gallery_m,
+            conf_thr=0.0,
+        )
+    else:
+        raise ValueError(f"Unsupported matcher: {match_name}")
+
+    n_raw = len(conf)
     valid = conf >= conf_thr
     mkpts0, mkpts1, conf = mkpts0[valid], mkpts1[valid], conf[valid]
+    print(f"  [{match_name}] matches after conf>={conf_thr}: {len(conf)} / {n_raw}")
 
     # match_img = draw_loftr_matches(query_l, gallery_l, mkpts0, mkpts1, conf, None)
 
@@ -299,7 +397,7 @@ def get_T0(query_info, gallery_info, nets, K, reproj_thr):
 
     matching_results = compute_matches( query_crop, gallery_crop, nets[3] )
     # matcher input size in the matcher options
-    match_in_size = nets[3][1]["input_size"]
+    match_in_size = nets[3]["options"]["input_size"]
     pts0, pts1, conf = unmap_inlier_matches( matching_results, (q_bbox_ext, g_bbox_ext), query_info["mask"], match_in_size)
 
     # gimg = np.zeros((1080, 1920, 3), dtype=np.uint8)
@@ -474,10 +572,12 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, options):
     
     
 def estimate_object_pose(query, gallery_info, nets, gProxy:RigidPoseGaussianProxy, K, pnp_option, render_options):
+    total_t0 = sync_time()
     query_bgr = cv2.cvtColor(query, cv2.COLOR_RGB2BGR)
     q_mask = detect_segment(query_bgr, nets[:2])
     q_bbox = compute_bbox(q_mask)  
-    
+    t_step1 = sync_time()
+
     query_info = {
         "rgb": query,    # full query image (RGB)
         "mask": q_mask,   # full query mask (grayscale, 0=background, 255=foreground)
@@ -487,10 +587,12 @@ def estimate_object_pose(query, gallery_info, nets, gProxy:RigidPoseGaussianProx
 
     # Best gallery selection - Feature matching - PnP
     R0, t0 = get_T0(query_info, gallery_info, nets, K, pnp_option["reproj_thr"])
+    t_step56 = sync_time()
 
     # Render & Compare
     gProxy.set_T(R0, t0)
     R, t, t_loss, bbox = refine_pose(query_info, gProxy, render_options)
+    t_refine = sync_time()
     print(f"R: {R} \nt: {t*100}(cm) \ntracking loss: {t_loss}")
 
     return R, t, t_loss, bbox

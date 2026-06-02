@@ -27,16 +27,25 @@
         "name": "DINOv2",
         "options": {
             "model": "dinov2_vits14",
-            "input_size": 224
+            "input_size": 224,
+            "onnx": "weights/dino_vits14_224.onnx",
+            "trt_cache_dir": "weights/trt_cache",
+            "warmup": true,
+            "warmup_runs": 1,
+            "require_gpu": true
         }
 
     },
     "matcher": {
-        "name": "LoFTR",
+        "name": "EDM_TRT",
+        "onnx": "weights/edm_outdoor_w672_h672_topk2469.onnx",
+        "trt_cache_dir": "weights/trt_cache",
         "options": {
-            "pretrained": "outdoor",
             "conf_thr": 0.5,
-            "input_size": 840
+            "input_size": 672,
+            "warmup": true,
+            "warmup_runs": 1,
+            "require_gpu": true
         }
     },
     "pnp": {
@@ -61,7 +70,15 @@
         "input - type: [file, dir, cam]",
         "               file: a single image file",
         "               dir: image files in dir",
-        "               cam: image from a cam"
+        "               cam: image from a cam",
+        {
+            "name": "LoFTR",
+            "options": {
+                "pretrained": "outdoor",
+                "conf_thr": 0.5,
+                "input_size": 840
+            }
+        }
     ]
 }
 

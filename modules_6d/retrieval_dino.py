@@ -145,6 +145,88 @@ class DinoV2Extractor:
         return torch.row_stack( (feat0, feat1, feat2, feat3) ).reshape(-1)
 
 
+def load_dino_trt_session(onnx_path, trt_cache_dir=None, require_gpu=True):
+    from modules_6d.retrieval_edm import _try_preload_ort_gpu_libs
+    import onnxruntime as ort
+
+    _try_preload_ort_gpu_libs()
+
+    providers = []
+    trt_options = {}
+    if trt_cache_dir:
+        trt_cache_dir = Path(trt_cache_dir)
+        trt_cache_dir.mkdir(parents=True, exist_ok=True)
+        trt_options = {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": str(trt_cache_dir),
+        }
+    providers.append(("TensorrtExecutionProvider", trt_options))
+    providers.append("CUDAExecutionProvider")
+    providers.append("CPUExecutionProvider")
+
+    session = ort.InferenceSession(str(onnx_path), providers=providers)
+    print(f"  [DINO TRT] Loaded: {onnx_path}")
+    print(f"  [DINO TRT] Providers: {session.get_providers()}")
+    if require_gpu and not any(
+        p in session.get_providers()
+        for p in ("TensorrtExecutionProvider", "CUDAExecutionProvider")
+    ):
+        raise RuntimeError(
+            "DINO TRT requested, but ONNXRuntime fell back to CPUExecutionProvider."
+        )
+    return session
+
+
+class DinoV2ExtractorTRT:
+    """DINOv2 inference via ONNXRuntime TensorRT EP."""
+
+    def __init__(self, model_name: str, sess):
+        try:
+            from transformers import AutoImageProcessor
+        except Exception as e:
+            raise ImportError(
+                'transformers is required for DinoV2ExtractorTRT. '
+                'Install with: pip install transformers'
+            ) from e
+
+        hf_name = {
+            'dinov2_vits14': 'facebook/dinov2-small',
+            'dinov2_vitb14': 'facebook/dinov2-base',
+            'dinov2_vitl14': 'facebook/dinov2-large',
+        }.get(model_name, model_name)
+
+        self.processor = AutoImageProcessor.from_pretrained(hf_name)
+        self._sess = sess
+        self._input_name = sess.get_inputs()[0].name
+        self.device = "cuda"
+
+    def _encode_np(self, pixel_values: np.ndarray) -> torch.Tensor:
+        outputs = self._sess.run(None, {self._input_name: pixel_values})
+        if len(outputs) > 1 and outputs[1].ndim == 2:
+            feat = torch.from_numpy(outputs[1])
+        else:
+            feat = torch.from_numpy(outputs[0][:, 0, :])
+        return F.normalize(feat, dim=-1).squeeze(0)
+
+    def encode_bgr(self, img_bgr: np.ndarray) -> torch.Tensor:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pixel_values = self.processor(images=rgb, return_tensors="np")["pixel_values"].astype(np.float32)
+        return self._encode_np(pixel_values)
+
+    def encode_rgb(self, img_rgb: np.ndarray) -> torch.Tensor:
+        pixel_values = self.processor(images=img_rgb, return_tensors="np")["pixel_values"].astype(np.float32)
+        return self._encode_np(pixel_values)
+
+    def encode_4rgb(self, img_rgb: np.ndarray) -> torch.Tensor:
+        assert img_rgb.shape[0] == 224 * 2 and img_rgb.shape[1] == 224 * 2, \
+            "Input must be 448x448 RGB image containing 4 tiles"
+        feat0 = self.encode_rgb(img_rgb[:224, :224])
+        feat1 = self.encode_rgb(img_rgb[:224, 224:])
+        feat2 = self.encode_rgb(img_rgb[224:, :224])
+        feat3 = self.encode_rgb(img_rgb[224:, 224:])
+        return torch.row_stack((feat0, feat1, feat2, feat3)).reshape(-1)
+
+
 def run_step4_dino_retrieval(args):
     query_path = Path(args.query_masked_path)
     gallery_dir = Path(args.gallery_dir)
