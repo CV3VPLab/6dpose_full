@@ -1,5 +1,6 @@
 data/
+weights/
 *.pyc
 *.pt
 utils/__pycache__/*.pyc
-weights/
+
