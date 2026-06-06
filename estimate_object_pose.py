@@ -29,7 +29,7 @@ except Exception:
 from pathlib import Path
 from modules_6d.yolo_sam import load_yolo_model, detect_with_yolo, load_sam2_predictor, segment_from_bbox
 from modules_6d.retrieval_dino import DinoV2Extractor, DinoV2ExtractorTRT, load_dino_trt_session
-from modules_6d.retrieval_dino_loftr import compute_loftr_matches, draw_loftr_matches
+from modules_6d.retrieval_dino_loftr import compute_loftr_matches
 from modules_6d.retrieval_edm import (
     compute_edm_matches,
     compute_edm_trt_matches,
@@ -37,7 +37,7 @@ from modules_6d.retrieval_edm import (
     load_edm_trt_session,
     warmup_edm_trt_session,
 )
-from modules_6d.step6_translation import get_initial_pose, get_gallery_pose, project_axes_overlay
+from modules_6d.step6_translation import get_initial_pose, get_gallery_pose
 from refine_pose import (
     RigidPoseGaussianProxy, CosineWarmupScheduler, 
     dssim_loss, dms_ssim_loss, 
@@ -46,7 +46,7 @@ from refine_pose import (
 from tqdm import tqdm
 import time
 
-from utils.io_utils import load_json, load_intrinsics, resolve_ply_path 
+from utils.io_utils import load_json, save_json, load_intrinsics, resolve_ply_path 
 from utils.image_utils import (
     load_rgb, render_to_image, compute_nonblack_bbox,
     expand_bbox, compute_bbox, get_bbox_size, square_bbox, crop_with_bbox, square_pad_resize, unmap_to_full_image, 
@@ -496,30 +496,18 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, options):
         # 1. Silhouette (Mask) Loss
         masked_render_crop = render_crop * query_mask.unsqueeze(0)
         render_alpha = (masked_render_crop.sum(dim=0, keepdim=True) > 0.05).float()
-        loss_mask = F.l1_loss(render_alpha, query_mask)
+        loss_mask = F.l1_loss(render_alpha.squeeze(), query_mask)
 
         # 2. RGB Loss (SSIM, L1)
         loss_ssim = dssim_loss(masked_render_crop, query_crop) + dms_ssim_loss(masked_render_crop, query_crop)
         loss_l1_rgb = F.l1_loss(masked_render_crop, query_crop)
 
         # 3. Blur Loss
-        blur_target = F.avg_pool2d(query_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
-        blur_render = F.avg_pool2d(masked_render_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
+        blur_target = F.avg_pool2d(query_crop, kernel_size=9, stride=1, padding=4)
+        blur_render = F.avg_pool2d(masked_render_crop, kernel_size=9, stride=1, padding=4)
         loss_blur = F.l1_loss(blur_render, blur_target)
 
-        ecc_loss = ecc_loss_fn(masked_render_crop.unsqueeze(0), query_crop.unsqueeze(0))
-
-        # render_alpha = (render_crop.sum(dim=0, keepdim=True) > 0.05).float()
-        # loss_mask = F.l1_loss(render_alpha, query_mask)
-
-        # # 2. RGB Loss (SSIM, L1)
-        # loss_ssim = dssim_loss(render_crop, query_crop) + dms_ssim_loss(render_crop, query_crop)
-        # loss_l1_rgb = F.l1_loss(render_crop, query_crop)
-
-        # # 3. Blur Loss
-        # blur_target = F.avg_pool2d(query_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
-        # blur_render = F.avg_pool2d(render_crop.unsqueeze(0), kernel_size=9, stride=1, padding=4).squeeze(0)
-        # loss_blur = F.l1_loss(blur_render, blur_target)
+        ecc_loss = ecc_loss_fn(masked_render_crop, query_crop)
 
         # 4. [핵심] Dynamic Weighting (Coarse-to-Fine)
         # 초반: Blur 중심 (크게 돌리기) / 후반: SSIM 중심 (칼같이 맞추기)
@@ -538,7 +526,7 @@ def refine_pose(query_info, gProxy:RigidPoseGaussianProxy, options):
         optimizer.step()
         scheduler.step()
 
-        tracking_loss = float(loss_ssim.item() + loss_l1_rgb.item() + loss_blur.item() + loss_mask.item())
+        tracking_loss = float(loss_ssim.item() + loss_l1_rgb.item() + loss_blur.item() + loss_mask.item() + ecc_loss.item()) #  
         loss_val = float(loss.item())
         losses.append({"iter": it, "loss": loss_val, "track_loss": tracking_loss})
 
@@ -594,6 +582,8 @@ def estimate_object_pose(query, gallery_info, nets, gProxy:RigidPoseGaussianProx
     R, t, t_loss, bbox = refine_pose(query_info, gProxy, render_options)
     t_refine = sync_time()
     print(f"R: {R} \nt: {t*100}(cm) \ntracking loss: {t_loss}")
+    print(f"Timing: detection+segmentation={t_step1 - total_t0:.3f}s, retrieval+matching+PnP={t_step56 - t_step1:.3f}s, refinement={t_refine - t_step56:.3f}s")
+    print(f"refinement update: Δr={cv2.Rodrigues(R)[0].T - cv2.Rodrigues(R0)[0].T}, Δt={(t - t0)*100}(cm)")
 
     return R, t, t_loss, bbox
     
@@ -627,6 +617,7 @@ def main_object_pose_estimation():
     
     # perform
     performance = []
+    pose_results = []
     for i in range(len(query_paths)):
         query = load_rgb(query_paths[i])
         assert render_options["width"] == query.shape[1] and render_options["height"] == query.shape[0]
@@ -638,7 +629,7 @@ def main_object_pose_estimation():
         
         et = time.perf_counter()
         performance.append((et - st, t_loss))
-
+        
         # Visualization
         gaussian_proxy.set_T(R, t)
         comp_img = make_comp_image(query, gaussian_proxy, q_bbox)
@@ -646,6 +637,16 @@ def main_object_pose_estimation():
         vis_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(vis_path), cv2.cvtColor(comp_img, cv2.COLOR_RGB2BGR))
 
+        pose_record = {
+            "query":            str(query_paths[i].stem),
+            "R":                R.tolist(),
+            "t":                t.tolist(),
+            "tracking loss":    float(t_loss)            
+        }
+        pose_results.append(pose_record)
+        
+    save_json(obj_out_dir / "result" / "refined_pose.json", pose_results)
+    
     print("\n=== Performance Summary ===")
     print(f"pose estimation time: {np.mean([p[0] for p in performance]):.6f} seconds")
     print(f"tracking loss: {np.mean([p[1] for p in performance]):.6f}")

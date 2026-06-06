@@ -219,7 +219,7 @@ def solve_pose_pnp(pts2d, pts3d, K, R0,
         # tvec=np.zeros((3, 1), dtype=np.float64),
     )
 
-    print(f" [PnP] rvec: {rvec.ravel()}  tvec: {tvec.ravel()}")
+    # print(f" [PnP] rvec: {rvec.ravel()}  tvec: {tvec.ravel()}")
 
     if not success or inliers is None or len(inliers) < min_inliers:
         print(f"  [PnP] Stage 1 (EPnP) failed or insufficient inliers "
@@ -247,7 +247,7 @@ def solve_pose_pnp(pts2d, pts3d, K, R0,
     else:
         print(f"  [PnP] Stage 2 refine failed, using Stage 1 result")
 
-    print(f" [PnP] rvec: {rvec.ravel()}  tvec: {tvec.ravel()}")
+    # print(f" [PnP] rvec: {rvec.ravel()}  tvec: {tvec.ravel()}")
 
     R_out, _ = cv2.Rodrigues(rvec)
     t_out = tvec.ravel()
@@ -1339,7 +1339,7 @@ def get_initial_pose(xyz_map, pts_2d_xyz, pts_2d_query, conf, K, R0, reproj_thre
             f"Not enough correspondences after 3D outlier filtering: {n_valid}"
         )
 
-    use_uniform_sampling = True
+    use_uniform_sampling = False #  True
     if use_uniform_sampling:
         keep_idx, uniform_cell_stats = uniform_sample_points_2d(
             pts2d,
