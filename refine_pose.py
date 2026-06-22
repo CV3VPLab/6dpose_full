@@ -419,11 +419,25 @@ class RigidPoseGaussianProxy:
 
     def get_T(self):
         return self.R, self.t
+    
+    def set_K(self, K):
+        self.K_mat = torch.tensor(K, dtype=torch.float32, device='cuda').unsqueeze(0)  # (1,3,3)
+
+    def set_resolution(self, width, height):
+        self.width = width
+        self.height = height
 
     def toGPUTensor(self, arr):
         return torch.tensor(arr.astype(np.float32), dtype=torch.float32, device='cuda')
     
-    def render(self, width=1920, height=1080):
+    def render(self, width=None, height=None):
+        if width is None:
+            assert hasattr(self, "width")
+            width = self.width
+        if height is None:
+            assert hasattr(self, "height")
+            height = self.height
+
         return _rasterize(
             means = self.get_xyz, quats=self.get_rotation,
             scales = self.get_scaling, opacities=self.get_opacity.squeeze(-1),

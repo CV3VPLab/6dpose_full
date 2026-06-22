@@ -159,6 +159,10 @@ def load_dino_trt_session(onnx_path, trt_cache_dir=None, require_gpu=True):
         trt_options = {
             "trt_engine_cache_enable": True,
             "trt_engine_cache_path": str(trt_cache_dir),
+            'trt_profile_min_shapes': 'pixel_values:1x3x224x224',
+            'trt_profile_opt_shapes': 'pixel_values:1x3x224x224',
+            'trt_profile_max_shapes': 'pixel_values:1x3x224x224',
+            'trt_engine_builder_workspace_size': 4294967296
         }
     providers.append(("TensorrtExecutionProvider", trt_options))
     providers.append("CUDAExecutionProvider")

@@ -135,6 +135,10 @@ def load_edm_trt_session(onnx_path, trt_cache_dir=None, require_gpu=True):
         trt_options = {
             "trt_engine_cache_enable": True,
             "trt_engine_cache_path": str(trt_cache_dir),
+            'trt_profile_min_shapes': 'input:1x2x672x672',
+            'trt_profile_opt_shapes': 'input:1x2x672x672',
+            'trt_profile_max_shapes': 'input:1x2x672x672',
+            'trt_engine_builder_workspace_size': 4294967296
         }
     providers.append(("TensorrtExecutionProvider", trt_options))
     providers.append("CUDAExecutionProvider")

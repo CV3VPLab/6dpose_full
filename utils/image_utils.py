@@ -9,9 +9,12 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import torch
-import cv2
 import numpy as np
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from pathlib import Path
 from tqdm import tqdm
 from .io_utils import load_json
@@ -22,6 +25,7 @@ def mse(img1, img2):
 def psnr(img1, img2):
     mse = (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
+
 
 def compute_nonblack_bbox(img_bgr: np.ndarray, thresh: int = 8):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -64,7 +68,16 @@ def extract_bbox(img: np.ndarray, margin: int, thresh: int = 8):
 
 def crop_with_bbox(img, bbox):
     x1, y1, x2, y2 = bbox
-    return img[y1:y2, x1:x2].copy()
+
+    if isinstance(img, torch.Tensor):
+        if img.dim() == 3:
+            return img[:, y1:y2, x1:x2].clone()
+        elif img.dim() == 2:
+            return img[y1:y2, x1:x2].clone()
+        else:
+            raise ValueError(f"Unsupported tensor shape: {img.shape}")
+    else:
+        return img[y1:y2, x1:x2].copy()
 
 
 def extract_bbox_and_crop(img, margin=12, thresh=8):
@@ -245,3 +258,224 @@ def make_gallery_square(galleryInfo, idx, size):
 
 def render_to_image(render):
     return (render.clamp(0, 1).detach().cpu().numpy() * 255.0).astype(np.uint8)
+
+
+def np_to_tensor(innp: np.ndarray, device='cuda'):
+    resT = torch.from_numpy(innp).to(device).float() / 255.0
+    if innp.ndim == 3:
+        assert innp.shape[2] == 1 or innp.shape[2] == 3
+        resT = resT.permute(2,0,1)
+    return resT
+
+        
+def tensor_to_np(tensor: torch.Tensor):
+    tensor = tensor.detach().cpu()
+    if tensor.dim() == 4:
+        assert tensor.shape[0] == 1, "we assume that a tensor of bchw format has a single batch size"
+        tensor = tensor.squeeze(0)    
+    if tensor.dim() == 3:
+        tensor = tensor.permute(1,2,0)
+    return tensor.numpy()
+
+
+def npfloat_to_image(innp: np.ndarray):
+    assert innp.dtype.kind == 'f'
+    if np.min(innp) < 0:    # float
+        innp = innp + 0.5    
+    return (innp * 255.0).astype(np.uint8)
+
+
+def tensor_to_image(tensor: torch.Tensor):
+    return npfloat_to_image(tensor_to_np(tensor))
+
+
+def get_boundary(binimg: np.ndarray):
+    if not hasattr(get_boundary, "kernel"):
+        get_boundary.kernel = np.ones((3, 3), np.uint8)
+
+    eimg = cv2.erode(binimg, get_boundary.kernel, iterations=1)
+    return binimg - eimg
+
+def bin_to_color(binimg: np.ndarray, color):
+    assert len(color) == 3
+    resimg = np.zeros((binimg.shape[0], binimg.shape[1], 3), dtype=binimg.dtype)
+    resimg[:,:,0] = binimg * color[0]
+    resimg[:,:,1] = binimg * color[1]
+    resimg[:,:,2] = binimg * color[2]
+    return resimg
+
+
+def scale_image_draw_maskcontour(img: np.ndarray, scale, mask: np.ndarray, color):
+    scaledimg = (img.astype(np.float32) * scale).astype(np.uint8)
+    contours, _ = cv2.findContours( mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
+    resimg = cv2.drawContours(scaledimg, contours, -1, tuple(color), 1)
+    return resimg
+
+
+def draw_crop_matches(gcrop, qcrop, gbbox, qbbox, pts0, pts1, conf, out_path):
+    gimg = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    qimg = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    gimg[gbbox[1]:gbbox[3], gbbox[0]:gbbox[2]] = gcrop
+    qimg[qbbox[1]:qbbox[3], qbbox[0]:qbbox[2]] = qcrop
+    match_img = draw_matches(qimg, gimg, pts0, pts1, conf, out_path)
+    return match_img
+
+
+def draw_matches(img0, img1, mkpts0, mkpts1, conf, out_path, max_draw=400):
+    h0, w0 = img0.shape[:2]
+    h1, w1 = img1.shape[:2]
+    H = max(h0, h1)
+    canvas = np.zeros((H, w0 + w1, 3), dtype=np.uint8)
+    canvas[:h0, :w0] = img0
+    canvas[:h1, w0:] = img1
+    canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+
+    idx = np.arange(len(mkpts0))
+    if len(idx) > max_draw:
+        idx = np.argsort(-conf)[:max_draw]
+
+    for i in idx:
+        p0 = tuple(np.round(mkpts0[i]).astype(int))
+        p1 = tuple(np.round(mkpts1[i]).astype(int) + np.array([w0, 0]))
+        color = (0, 255, 0)
+        cv2.line(canvas, p0, p1, color, 1, cv2.LINE_AA)
+        cv2.circle(canvas, p0, 2, (0, 255, 255), -1)
+        cv2.circle(canvas, p1, 2, (0, 255, 255), -1)
+
+    if out_path is not None:
+        cv2.imwrite(str(out_path), canvas)
+
+    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+
+def draw_contour(img: np.ndarray, mask: np.ndarray, color=(0,255,0), thickness=1):
+    if mask.dtype is not np.uint8:
+        mask = mask.astype(np.uint8) * 255        
+    contour, _ = cv2.findContours( mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
+    cv2.drawContours(img, contour, -1, color, thickness)
+
+def get_gradient_filters(device='gpu'):
+    sobel_x = torch.tensor([[-1., 0., 1.],
+                            [-2., 0., 2.],
+                            [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1., -2., -1.],
+                            [0., 0., 0.],
+                            [1., 2., 1.]], device=device).view(1, 1, 3, 3)
+    sobel_x = sobel_x.repeat(1, 1, 1, 1)
+    sobel_y = sobel_y.repeat(1, 1, 1, 1)
+    return sobel_x, sobel_y
+
+
+def compute_gradients(image, filters_x, filters_y):
+    if image.shape[1] > 1:
+        image = image.mean(dim=1, keepdim=True)
+    grad_x = F.conv2d(image, filters_x, padding=1)
+    grad_y = F.conv2d(image, filters_y, padding=1)
+
+    grad_mag = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+    grad_dir = torch.cat([grad_x, grad_y], dim=1) / (grad_mag + 1e-6)
+
+    return grad_mag, grad_dir
+
+
+def erode_binary_tensor(img_tensor, kernel_size=3):
+    """
+    img_tensor: (B, C, H, W) 형태의 0과 1로 이루어진 이진 텐서
+    """
+    pad = kernel_size // 2
+    
+    # 1. 0과 1을 반전시킵니다.
+    inv_tensor = 1.0 - img_tensor
+    
+    # 2. 반전된 이미지에 Max Pooling (Dilation 효과)
+    dilated_inv = F.max_pool2d(inv_tensor, kernel_size, stride=1, padding=pad)
+    
+    # 3. 다시 반전시켜서 Erosion 결과 획득
+    eroded_tensor = 1.0 - dilated_inv
+    
+    return eroded_tensor
+
+
+def dice_loss(pred, target, smooth=1e-6):
+    """
+    pred: 모델의 출력값 (Logits). 형태는 보통 (N, C, H, W)
+    target: 정답 레이블 (0 또는 1). 형태는 pred와 동일
+    """
+    pred = pred.contiguous().view(-1)
+    target = target.contiguous().view(-1)
+    
+    intersection = (pred * target).sum()
+    union = pred.sum() + target.sum()
+    
+    dice_score = (2. * intersection + smooth) / (union + smooth)
+    return 1. - dice_score
+
+
+def iou_loss(pred, target, smooth=1e-6):
+    pred = torch.sigmoid(pred)
+    
+    pred = pred.contiguous().view(-1)
+    target = target.contiguous().view(-1)
+    
+    intersection = (pred * target).sum()
+    total = pred.sum() + target.sum()
+    union = total - intersection # A U B = A + B - (A ∩ B)
+    
+    iou_score = (intersection + smooth) / (union + smooth)
+    return 1. - iou_score
+
+
+class FFTLoss(nn.Module):
+    def __init__(self, loss_type='l1'):
+        super(FFTLoss, self).__init__()
+        self.loss_type = loss_type
+
+    def forward(self, pred, target):
+        pred_fft = torch.fft.fft2(pred, norm='ortho')
+        target_fft = torch.fft.fft2(target, norm='ortho')
+
+        if self.loss_type == 'l1':
+            pred_real_imag = torch.view_as_real(pred_fft)
+            target_real_imag = torch.view_as_real(target_fft)
+
+            loss = F.l1_loss(pred_real_imag, target_real_imag)
+
+        elif self.loss_type == 'magnitude':
+            diff = pred_fft - target_fft
+            loss = torch.mean(torch.abs(diff))
+
+        else:
+            raise ValueError("loss_type must be 'l1' or 'magnitude'")
+        
+        return loss
+    
+
+def gradient_matching_loss(render_img, query_img, alpha=0.5, mask=None):
+    device = render_img.device
+    filters_x, filters_y = get_gradient_filters(device)
+    emask = erode_binary_tensor(mask.unsqueeze(0), 3).squeeze(0)
+    render_grad_mag, render_grad_dir = compute_gradients(render_img.unsqueeze(0), filters_x, filters_y)
+    query_grad_mag, query_grad_dir = compute_gradients(query_img.unsqueeze(0), filters_x, filters_y)
+    
+    mag_loss = F.l1_loss(render_grad_mag * emask, query_grad_mag * emask)
+    cos_sim = F.cosine_similarity(render_grad_dir, query_grad_dir, dim=1)
+    dir_loss = (1 - cos_sim).mean()
+    total_loss = (1 - alpha) * mag_loss + alpha * dir_loss
+
+    return total_loss, mag_loss, dir_loss
+
+class GradientPriorLoss(nn.Module):
+    def __init__(self, alpha=0.8, eps=1e-6):
+        super(GradientPriorLoss, self).__init__()
+        self.alpha = alpha
+        self.eps = eps
+
+    def forward(self, pred):
+        dx = pred[:,:,:,1:] - pred[:,:,:,:-1]
+        dy = pred[:,:,1:,:] - pred[:,:,:-1,:]
+        loss_dx = torch.mean((torch.abs(dx) + self.eps) ** self.alpha)
+        loss_dy = torch.mean((torch.abs(dy) + self.eps) ** self.alpha)
+
+        return loss_dx + loss_dy
+    
+

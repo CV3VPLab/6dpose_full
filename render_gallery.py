@@ -12,10 +12,10 @@ from gsplat import rasterization as _gsplat_rasterize
 
 from modules_6d.retrieval_dino import DinoV2Extractor
 
-from modules_6d.io_utils import (
+from utils.io_utils import (
     ensure_dir, 
-    save_json,
-    resolve_ply_path
+    resolve_ply_path,
+    load_intrinsics, K_to_params
 )
 from utils.image_utils import (
     extract_bbox_and_crop, 
@@ -25,7 +25,7 @@ from utils.image_utils import (
     zeropad_square,
     load_rgb
 )
-from modules_6d.io_utils import load_intrinsics, K_to_params
+from utils.geom_utils import depth_to_xyz_map
 
 
 def parse_args():
@@ -52,17 +52,6 @@ def parse_args():
     p.add_argument("--dino_model", type=str, default="dinov2_vits14")
     p.add_argument("--dino_input_size", type=int, default=224)
     return p.parse_args()
-
-
-def ensure_dir(path):
-    Path(path).mkdir(parents=True, exist_ok=True)
-
-
-def save_json(path, data):
-    path = Path(path)
-    ensure_dir(path.parent)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def load_gallery_poses(path):
@@ -173,37 +162,6 @@ def get_depth_img(depth_np):
 
     return img
 
-
-def depth_to_xyz_map(depth_np, fx, fy, cx, cy, R_obj_to_cam, t_obj_to_cam):
-    H, W = depth_np.shape
-    uu, vv = np.meshgrid(np.arange(W), np.arange(H))
-
-    assert depth_np.dtype == np.float32, f"Expected depth_np to be float32"
-    Z = depth_np
-    valid = Z > 1e-8
-
-    Xc = (uu - cx) * Z / fx
-    Yc = (vv - cy) * Z / fy
-
-    xyz_cam = np.stack([Xc, Yc, Z], axis=-1).astype(np.float32)   # [H,W,3]
-
-    R = np.asarray(R_obj_to_cam, dtype=np.float32)
-    t = np.asarray(t_obj_to_cam, dtype=np.float32)
-
-    xyz_obj = np.zeros_like(xyz_cam, dtype=np.float32)
-
-    pts = xyz_cam.reshape(-1, 3)
-    valid_flat = valid.reshape(-1)
-
-    pts_valid = pts[valid_flat]
-    # Xc = R Xo + t  ->  Xo = R^T (Xc - t)
-    pts_obj_valid = (pts_valid - t[None, :]) @ R
-
-    xyz_obj = xyz_obj.reshape(-1, 3)
-    xyz_obj[valid_flat] = pts_obj_valid
-    xyz_obj = xyz_obj.reshape(H, W, 3)
-
-    return xyz_obj
 
 def project_obj_to_image(X_obj, fx, fy, cx, cy, R_obj_to_cam, t_obj_to_cam):
     X_obj = np.asarray(X_obj, dtype=np.float32).reshape(3, 1)
@@ -348,12 +306,6 @@ def run_render_gallery(args, gaussians=None):
                     assert depth_hw.ndim == 2, f"Expected depth tensor to have 2 dimensions (H,W), got {depth_hw.shape}. If it has 3 dims, add squeeze"
                     depth_np = depth_hw.detach().cpu().numpy()
 
-                # gsplat depth output is already in metric units (same unit as
-                # canonical Gaussian means after apply_scale=1). No scale
-                # correction needed: the rendered depth at the object center
-                # pixel equals the front-surface depth, not the canonical
-                # origin depth, so origin-based heuristics overcorrect by ~radius/distance.
-
                 xyz_obj = depth_to_xyz_map(
                     depth_np=depth_np,
                     fx=fx, fy=fy, cx=cx, cy=cy,
@@ -396,18 +348,24 @@ def extract_dino_features(args, gallery_bboxes):
     cache_dir = Path(args.out_dir)
     print(f"  DINOv2 cache dir: {cache_dir}")
 
-    features = torch.zeros( size=[len(gallery_bboxes), 384*4], dtype=torch.float32 )  
+    n_horz_patches = 1 if bbox_size < dino_in_size else 2
+    dino_out_size = 384 * n_horz_patches * n_horz_patches
 
-    render_dir = Path(args.out_dir) / "gallery"
-    for idx in tqdm(range(len(gallery_bboxes)), desc="DINO feature extraction"):
+    features = torch.zeros( size=[len(gallery_bboxes), dino_out_size], dtype=torch.float32 )  
+
+    render_dir = Path(args.out_dir) / "gallery"    
+    for idx in tqdm(range(len(gallery_bboxes)), desc=f"DINO feature extraction (feat. dim: {dino_out_size})"):
         img_rgb_crop = load_rgb(render_dir / f"{idx:04d}.png")
         assert gallery_bboxes[idx][2] - gallery_bboxes[idx][0] == img_rgb_crop.shape[1] and gallery_bboxes[idx][3] - gallery_bboxes[idx][1] == img_rgb_crop.shape[0], f"Crop size mismatch: expected ({gallery_bboxes[idx][2] - gallery_bboxes[idx][0]}, {gallery_bboxes[idx][3] - gallery_bboxes[idx][1]}), got {img_rgb_crop.shape[1]}, {img_rgb_crop.shape[0]}"
         gallery_crop, _ = zeropad_square(img_rgb_crop, bbox_size)
         
         # 4 tiles of DINO input, each tile gets a quarter of the original bbox crop (with some shared margin)
-        gallery_crop_dino = square_pad_resize(gallery_crop, dino_in_size * 2)  
-        feat = extractor.encode_4rgb(gallery_crop_dino)
-        assert feat.shape == (384*4,), f"Unexpected DINO feature shape: {feat.shape}"
+        gallery_crop_dino = square_pad_resize(gallery_crop, dino_in_size * n_horz_patches)  
+        if n_horz_patches == 1:
+            feat = extractor.encode_rgb(gallery_crop_dino)
+        else:
+            feat = extractor.encode_4rgb(gallery_crop_dino)
+        assert feat.shape == (dino_out_size,), f"Unexpected DINO feature shape: {feat.shape}"
 
         features[idx] = feat
         # feat = feat.numpy()
@@ -419,7 +377,7 @@ def extract_dino_features(args, gallery_bboxes):
 
     print(f"Saved DINO features {features_np.shape}")
     
-    return features # (3024, 1536) CPU tensor
+    return features # (3024, 384 * n_horz_patches ^ 2) CPU tensor
 
 
 def main():

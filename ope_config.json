@@ -1,9 +1,15 @@
 {
-    "input": {
+    "input_femto_bolt": {
         "type": "dir",  
         "name": "00001.jpg",
         "cam_type": "femto_bolt",
         "K_filename": "intrinsics_ds.txt"
+    },
+    "input_zed_m": {
+        "type": "dir",  
+        "name": "00001.jpg",
+        "cam_type": "zed_m",
+        "K_filename": "calibration.json"
     },
     "object": "can_mtdew"
     ,
@@ -58,10 +64,10 @@
             "height": 1080,
             "background": [0,0,0],
             "sh_degree": 3,
-            "iters": 100,
-            "lr_rot": 1e-2,
-            "lr_trans": 5e-3,
-            "warmup_steps": 10,
+            "iters": 70,
+            "lr_rot": 2e-3,
+            "lr_trans": 3e-3,
+            "warmup_steps": 7,
             "early_stop_steps": 20,
             "early_stop_thr": 1e-5
         }
