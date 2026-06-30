@@ -46,7 +46,7 @@
                 "--intrinsics_path", "data/camera/femto_bolt/intrinsics_ds.txt",
                 "--width", "1920",
                 "--height", "1080",
-                "--background", "0,0,0",                
+                "--background", "0,0,0",                // black; for pink use "--background", "255,0,255"
                 "--sh_degree", "3",
                 "--gs_mode", "3dgs",
                 "--dino_model", "dinov2_vits14",
