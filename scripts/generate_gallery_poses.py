@@ -131,7 +131,22 @@ def radii_by_direction(
     levels: np.ndarray,
     default_radii: list[float],
     level_radii: dict[int, list[float]] | None,
+    roll_scheme: str,
 ) -> list[list[float]]:
+    if roll_scheme == "level2_close_rolls":
+        radii = []
+        for level in levels:
+            level_int = int(level)
+            if level_int == 0:
+                radii.append([0.7])
+            elif level_int == 1:
+                radii.append([0.6])
+            elif level_int == 2:
+                radii.append([0.5, 0.4])
+            else:
+                radii.append([])
+        return radii
+
     if level_radii is None:
         return [default_radii for _ in range(len(levels))]
 
@@ -142,6 +157,18 @@ def radii_by_direction(
             raise ValueError(f"--level_radii does not define radius for icosphere level {level_int}")
         radii.append([float(r) for r in level_radii[level_int]])
     return radii
+
+
+def rolls_by_direction(
+    levels: np.ndarray,
+    roll_scheme: str,
+    default_rolls: list[float],
+) -> list[list[float]]:
+    if roll_scheme == "uniform":
+        return [default_rolls for _ in range(len(levels))]
+    if roll_scheme == "level2_close_rolls":
+        return [[] for _ in range(len(levels))]
+    raise ValueError(f"Unsupported roll scheme: {roll_scheme}")
 
 
 def direction_to_az_el(direction: np.ndarray) -> tuple[float, float]:
@@ -178,7 +205,7 @@ def generate_poses(
     levels: np.ndarray,
     midpoint_positions: np.ndarray,
     per_direction_radii: list[list[float]],
-    roll_angles_deg: list[float],
+    per_direction_rolls: list[list[float]],
     look_at: np.ndarray,
     up_hint: np.ndarray,
     min_elevation_deg: float,
@@ -194,8 +221,13 @@ def generate_poses(
         for radius in per_direction_radii[dir_idx]:
             camera_pos = look_at + float(radius) * direction
             R_base = make_opencv_obj_to_cam(camera_pos, look_at, up_hint)
+            rolls = per_direction_rolls[dir_idx]
+            if int(levels[dir_idx]) == 2 and float(radius) == 0.4:
+                rolls = [float(v) for v in range(0, 360, 30)]
+            elif not rolls:
+                rolls = [0.0, 72.0, 144.0, 216.0, 288.0]
 
-            for roll in roll_angles_deg:
+            for roll in rolls:
                 R = R_base if float(roll) == 0.0 else make_roll_matrix(float(roll)) @ R_base
                 t = (-R @ camera_pos.reshape(3, 1))[:, 0]
                 T = np.eye(4, dtype=np.float64)
@@ -226,26 +258,6 @@ def save_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-
-
-def save_csv(path: Path, poses: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "index", "azimuth_deg", "elevation_deg", "radius", "roll_deg",
-            "icosphere_level", "icosphere_midpoint_position",
-            "cam_x", "cam_y", "cam_z", "tx", "ty", "tz",
-        ])
-        for pose in poses:
-            cx, cy, cz = pose["camera_position_obj_frame"]
-            tx, ty, tz = pose["t_obj_to_cam"]
-            writer.writerow([
-                pose["index"], pose["azimuth_deg"], pose["elevation_deg"],
-                pose["radius"], pose["roll_deg"],
-                pose["icosphere_level"], pose["icosphere_midpoint_position"],
-                cx, cy, cz, tx, ty, tz,
-            ])
 
 
 def save_preview(path: Path, poses: list[dict], preview_size: int) -> None:
@@ -294,9 +306,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Generate icosphere-sampled gallery_poses.json")
     p.add_argument("--out_dir", default="data", help="Output directory")
     p.add_argument("--subdivisions", type=int, default=4, help="0=12, 1=42, 2=162, 3=642, 4=2562 directions")
-    p.add_argument("--radius", default="0.4", help="Fallback radius list when --level_radii is not set")
+    p.add_argument("--radius", default="0.4,0.5,0.6,0.7", help="Fallback radius list when --level_radii is not set")
     p.add_argument("--level_radii", default=None, help="Level radii, e.g. '0:0.4,1:0.4,2:0.4,3:0.5,4:0.6'")
-    p.add_argument("--roll_angles_deg", default="0", help="Comma-separated in-plane roll angles")
+    p.add_argument("--roll_angles_deg", default="-90,-45,0,45,90", help="Comma-separated in-plane roll angles")
+    p.add_argument("--roll_scheme", default="uniform", choices=["uniform", "level2_close_rolls"])
     p.add_argument("--look_at", default="0,0,0", help="Object-frame look-at point")
     p.add_argument("--up_hint", default="0,0,1", help="Object-frame up hint")
     p.add_argument("--min_elevation_deg", type=float, default=-90.0)
@@ -318,13 +331,18 @@ def main() -> None:
     up_hint = normalize(parse_vec3(args.up_hint))
 
     directions, levels, midpoint_positions = build_icosphere_with_levels(args.subdivisions)
-    per_direction_radii = radii_by_direction(levels, default_radii, level_radii)
+    per_direction_radii = radii_by_direction(levels, default_radii, level_radii, args.roll_scheme)
+    per_direction_rolls = rolls_by_direction(
+        levels=levels,
+        roll_scheme=args.roll_scheme,
+        default_rolls=roll_angles_deg,
+    )
     poses = generate_poses(
         directions=directions,
         levels=levels,
         midpoint_positions=midpoint_positions,
         per_direction_radii=per_direction_radii,
-        roll_angles_deg=roll_angles_deg,
+        per_direction_rolls=per_direction_rolls,
         look_at=look_at,
         up_hint=up_hint,
         min_elevation_deg=float(args.min_elevation_deg),
@@ -359,8 +377,25 @@ def main() -> None:
             "radius_settings": {
                 "radius_list": default_radii,
                 "level_radii": level_radii,
+                "base_level": None,
+                "base_radius": None,
+                "new_vertex_radii": None,
             },
+            "roll_scheme": args.roll_scheme,
             "roll_angles_deg": roll_angles_deg,
+            "coarse_roll_angles_deg": [0.0, 72.0, 144.0, 216.0, 288.0],
+            "level2_close_rolls": {
+                "level0": {"radius": 0.7, "roll_angles_deg": [0, 72, 144, 216, 288]},
+                "level1": {"radius": 0.6, "roll_angles_deg": [0, 72, 144, 216, 288]},
+                "level2_far": {"radius": 0.5, "roll_angles_deg": [0, 72, 144, 216, 288]},
+                "level2_close": {"radius": 0.4, "roll_angles_deg": list(range(0, 360, 30))},
+            } if args.roll_scheme == "level2_close_rolls" else None,
+            "position_roll_level": 3,
+            "position_rolls": {
+                1: [0.0, 40.0, 80.0],
+                2: [120.0, 160.0, 200.0],
+                3: [240.0, 280.0, 320.0],
+            },
             "look_at": look_at.tolist(),
             "up_hint": up_hint.tolist(),
         },
@@ -369,10 +404,8 @@ def main() -> None:
     }
 
     json_path = out_dir / "gallery_poses.json"
-    csv_path = out_dir / "gallery_poses.csv"
     preview_path = out_dir / "gallery_pose_preview.png"
     save_json(json_path, payload)
-    save_csv(csv_path, poses)
     save_preview(preview_path, poses, preview_size=int(args.preview_size))
 
     print("[generate_gallery_poses.py] complete")
@@ -381,7 +414,6 @@ def main() -> None:
     print(f"  level counts : {level_counts}")
     print(f"  poses        : {len(poses)}")
     print(f"  json         : {json_path}")
-    print(f"  csv          : {csv_path}")
     print(f"  preview      : {preview_path}")
 
 
