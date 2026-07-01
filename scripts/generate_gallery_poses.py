@@ -390,12 +390,6 @@ def main() -> None:
                 "level2_far": {"radius": 0.5, "roll_angles_deg": [0, 72, 144, 216, 288]},
                 "level2_close": {"radius": 0.4, "roll_angles_deg": list(range(0, 360, 30))},
             } if args.roll_scheme == "level2_close_rolls" else None,
-            "position_roll_level": 3,
-            "position_rolls": {
-                1: [0.0, 40.0, 80.0],
-                2: [120.0, 160.0, 200.0],
-                3: [240.0, 280.0, 320.0],
-            },
             "look_at": look_at.tolist(),
             "up_hint": up_hint.tolist(),
         },
