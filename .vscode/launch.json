@@ -40,8 +40,9 @@
             "console": "integratedTerminal",
             "cwd":"${workspaceFolder}",
             "args": [
-                "--out_dir", "data/pose_test",
+                "--out_dir", "data",
                 "--subdivisions", "2",
+                "--radius", "0.4,0.5,0.6,0.7",
                 "--roll_scheme", "level2_close_rolls",
                 "--min_elevation_deg", "-90",
                 "--max_elevation_deg", "90",
