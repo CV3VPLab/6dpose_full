@@ -33,6 +33,24 @@
                 "--use_manual_fallback"
             ]
         },
+                {   "name": "Generate gallery poses",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/generate_gallery_poses.py",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "args": [
+                "--out_dir", "data",
+                "--subdivisions", "4",
+                "--level_radii", "0:0.4,1:0.4,2:0.4,3:0.5,4:0.6",
+                "--roll_angles_deg", "0",
+                "--look_at", "0,0,0",
+                "--up_hint", "0,0,1",
+                "--min_elevation_deg", "-90",
+                "--max_elevation_deg", "90",
+                "--preview_size", "900"
+            ]
+        },
         {   "name": "Step 4: Rendering gallery",
             "type": "debugpy",
             "request": "launch",
