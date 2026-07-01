@@ -42,7 +42,7 @@
             "args": [
                 "--out_dir", "data",
                 "--subdivisions", "2",
-                "--radius", "0.4,0.5,0.6,0.7",
+                "--radius", "0.5,0.6,0.7,0.8",
                 "--roll_scheme", "level2_close_rolls",
                 "--min_elevation_deg", "-90",
                 "--max_elevation_deg", "90",
