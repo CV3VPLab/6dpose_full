@@ -11,6 +11,8 @@
         "cam_type": "zed_m",
         "K_filename": "calibration.json"
     },
+    "objects": ["can_mtdew", "drill_yellow", "usb_3"]
+    ,
     "object": "can_mtdew"
     ,
     "detector": {
@@ -64,10 +66,10 @@
             "height": 1080,
             "background": [0,0,0],
             "sh_degree": 3,
-            "iters": 70,
+            "iters": 100,
             "lr_rot": 2e-3,
             "lr_trans": 3e-3,
-            "warmup_steps": 7,
+            "warmup_steps": 10,
             "early_stop_steps": 20,
             "early_stop_thr": 1e-5
         }
