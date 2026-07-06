@@ -58,11 +58,12 @@ from utils.image_utils import (
     expand_bbox, compute_bbox, get_bbox_size, square_bbox, crop_with_bbox, square_pad_resize, unmap_to_full_image, 
     make_gallery_square, construct_galleryInfo, 
     apply_mask, get_mask_inlier_indices,
-    erode_binary_tensor,
-    tensor_to_np, npfloat_to_image, np_to_tensor,
+    erode_binary_tensor,    
     scale_image_draw_maskcontour, draw_contour,
     dice_loss, gradient_matching_loss
 )
+from utils.image_utils import tensor_to_np as t2np, np_to_tensor as np2t, npfloat_to_image as npf2img
+
 from gaussian_renderer import GaussianModel
 from render_gallery import render_with_gsplat
 from utils.geom_utils import depth_tensor_to_xyz_map, mesh_from_depth_grid
@@ -287,8 +288,8 @@ def make_comp_image(query, gaussian_proxy:RigidPoseGaussianProxy, q_bbox, R0, t0
     
     q_crop_annotation = q_crop.copy()
     R, t = gaussian_proxy.get_T()
-    R_np = tensor_to_np(R)
-    t_np = tensor_to_np(t)
+    R_np = t2np(R)
+    t_np = t2np(t)
     K = gaussian_proxy.K_mat.cpu().numpy()[0]
     imgpts = project_obj_axes(K, R_np, t_np, 0.06)
     imgpts = imgpts - q_bbox[:2]
@@ -707,12 +708,12 @@ def refine_pose_stereo_GS(query_l_info, query_r_info,
     
     # crop the mask and masked query image for the refinement step
     # c_ : cropped, m_ : masked
-    query_l["c_mask"] = np_to_tensor(crop_with_bbox(query_l_info["mask"], query_l["bbox"]))    
-    query_l["m_crop"] = np_to_tensor(crop_with_bbox(query_l_info["masked_query"], query_l["bbox"]))
-    query_r["c_mask"] = np_to_tensor(crop_with_bbox(query_r_info["mask"], query_r["bbox"]))
-    query_r["m_crop"] = np_to_tensor(crop_with_bbox(query_r_info["masked_query"], query_r["bbox"]))
-    # qc = npfloat_to_image(tensor_to_np(query_l["crop"]))
-    # qcr = npfloat_to_image(tensor_to_np(query_r["crop"]))
+    query_l["c_mask"] = np2t(crop_with_bbox(query_l_info["mask"], query_l["bbox"]))    
+    query_l["m_crop"] = np2t(crop_with_bbox(query_l_info["masked_query"], query_l["bbox"]))
+    query_r["c_mask"] = np2t(crop_with_bbox(query_r_info["mask"], query_r["bbox"]))
+    query_r["m_crop"] = np2t(crop_with_bbox(query_r_info["masked_query"], query_r["bbox"]))
+    # qc = npf2img(t2np(query_l["crop"]))
+    # qcr = npf2img(t2np(query_r["crop"]))
     # plt.imshow( np.hstack(qc, qcr) )
 
     # ──────────────────────────────────────────────────────
@@ -879,8 +880,8 @@ def refine_pose_rerender(query_info, gProxy:RigidPoseGaussianProxy, options):
     
     # crop the mask and masked query image for the refinement step
     # c_ : cropped, m_ : masked
-    query["c_mask"] = np_to_tensor(crop_with_bbox(query_info["mask"], query["bbox"]))
-    query["m_crop"] = np_to_tensor(crop_with_bbox(query_info["masked_query"], query["bbox"]))
+    query["c_mask"] = np2t(crop_with_bbox(query_info["mask"], query["bbox"]))
+    query["m_crop"] = np2t(crop_with_bbox(query_info["masked_query"], query["bbox"]))
     
     # ──────────────────────────────────────────────────────
     # 4. Optimization
@@ -901,19 +902,18 @@ def refine_pose_rerender(query_info, gProxy:RigidPoseGaussianProxy, options):
                     min_lr       = options["lr_rot"] * 0.01,
                 )
 
+    ecc_loss_fn = ECCLoss()
+
+    # initial pose for left and right cam
     R0, t0 = gProxy.get_T()
+
+    K = gProxy.K_mat.squeeze(0)
+    fx, fy = t2np(K.diag()[:2])
+    cx, cy = t2np(K[:2, 2])
 
     losses = []
     best_loss  = 1e9
     best_state = {"R": R0.detach(), "t": t0.detach(), "iter": 0}
-
-    ecc_loss_fn = ECCLoss()
-
-    K = gProxy.K_mat.squeeze(0)
-    fx = K[0, 0].item()
-    fy = K[1, 1].item()
-    cx = K[0, 2].item()
-    cy = K[1, 2].item()
 
     with torch.no_grad():
         render_chw, depth_hw = render_with_gsplat(
@@ -1045,12 +1045,12 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
     
     # crop the mask and masked query image for the refinement step
     # c_ : cropped, m_ : masked
-    query_l["c_mask"] = np_to_tensor(crop_with_bbox(query_l_info["mask"], query_l["bbox"]))    
-    query_l["m_crop"] = np_to_tensor(crop_with_bbox(query_l_info["masked_query"], query_l["bbox"]))
-    query_r["c_mask"] = np_to_tensor(crop_with_bbox(query_r_info["mask"], query_r["bbox"]))
-    query_r["m_crop"] = np_to_tensor(crop_with_bbox(query_r_info["masked_query"], query_r["bbox"]))
-    # qc = npfloat_to_image(tensor_to_np(query_l["crop"]))
-    # qcr = npfloat_to_image(tensor_to_np(query_r["crop"]))
+    query_l["c_mask"] = np2t(crop_with_bbox(query_l_info["mask"], query_l["bbox"]))    
+    query_l["m_crop"] = np2t(crop_with_bbox(query_l_info["masked_query"], query_l["bbox"]))
+    query_r["c_mask"] = np2t(crop_with_bbox(query_r_info["mask"], query_r["bbox"]))
+    query_r["m_crop"] = np2t(crop_with_bbox(query_r_info["masked_query"], query_r["bbox"]))
+    # qc = npf2img(t2np(query_l["crop"]))
+    # qcr = npf2img(t2np(query_r["crop"]))
     # plt.imshow( np.hstack(qc, qcr) )
 
     # ──────────────────────────────────────────────────────
@@ -1074,15 +1074,14 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
 
     ecc_loss_fn = ECCLoss()
 
+    # initial pose for left and right cam
     R0, t0 = gProxy.get_T()
     R_r0 = R_lr @ R0
     t_r0 = t0 @ R_lr.T + t_lr 
 
     K = gProxy.K_mat.squeeze(0)
-    fx = K[0, 0].item()
-    fy = K[1, 1].item()
-    cx = K[0, 2].item()
-    cy = K[1, 2].item()
+    fx, fy = t2np(K.diag()[:2])
+    cx, cy = t2np(K[:2, 2])
 
     losses = []
     best_loss  = 1e9
@@ -1114,18 +1113,21 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
     render_l["c_mask"] = crop_with_bbox(depth_l_hw > FRUSTUM_N, render_l["bbox"])
     render_l["ci_mask"] = render_l["c_mask"] & query_l["c_mask"].bool()
     render_l["cif_mask"] = render_l["ci_mask"].float()
+
     render_r["crop0"] = crop_with_bbox(render_r_chw, render_r["bbox"])
     render_r["c_mask"] = crop_with_bbox(depth_r_hw > FRUSTUM_N, render_r["bbox"])
     render_r["ci_mask"] = render_r["c_mask"] & query_r["c_mask"].bool()
     render_r["cif_mask"] = render_r["ci_mask"].float()
 
     # mask = np.zeros((1080, 1920), np.bool_)
-    # mask[render_l["bbox"][1]:render_l["bbox"][3], render_l["bbox"][0]:render_l["bbox"][2]] = tensor_to_np(render_l["ci_mask"])
-    # msh = mesh_from_depth_grid(tensor_to_np(xyz_obj_l), tensor_to_np(valid_l) & mask, tensor_to_np(render_l_chw), tensor_to_np(depth_l_hw))
+    # mask[render_l["bbox"][1]:render_l["bbox"][3], render_l["bbox"][0]:render_l["bbox"][2]] = t2np(render_l["ci_mask"])
+    # msh = mesh_from_depth_grid(t2np(xyz_obj_l), t2np(valid_l) & mask, t2np(render_l_chw), t2np(depth_l_hw))
     
+    # xyz, xyz_colors : tensors
     xyz_l = crop_with_bbox(xyz_obj_l, render_l["bbox"])
     xyz_l = xyz_l[:, render_l["ci_mask"]]
     xyz_colors_l = render_l["crop0"][:, render_l["ci_mask"]]
+    
     xyz_r = crop_with_bbox(xyz_obj_r, render_r["bbox"])
     xyz_r = xyz_r[:, render_r["ci_mask"]]
     xyz_colors_r = render_r["crop0"][:, render_r["ci_mask"]]
@@ -1153,7 +1155,7 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
         sampled_colors_r = F.grid_sample(query_r["m_crop"].unsqueeze(0), pts2d_r.unsqueeze(0).unsqueeze(0),
                                        mode='bilinear', padding_mode='zeros', align_corners=True)
         sampled_colors_r = sampled_colors_r.squeeze(0).squeeze(1)
-
+        
         query_l["rm_crop"] = torch.zeros_like(query_l["m_crop"])
         query_l["rm_crop"][:, render_l["ci_mask"]] = sampled_colors_l
         query_r["rm_crop"] = torch.zeros_like(query_r["m_crop"])
@@ -1304,10 +1306,10 @@ def estimate_object_pose_stereo(query, query_r, gallery_info, nets,
 
     # Render & Compare
     gProxy.set_T(R0, t0)
-    # R, t, t_loss, bbox, bbox_r, losses = refine_pose_stereo_GS(query_info, query_r_info, 
-    #                                                            gProxy, render_options, R_lr, t_lr)
-    R, t, t_loss, bbox, bbox_r, losses = refine_pose_stereo_rerender(query_info, query_r_info, 
-                                                                     gProxy, render_options, R_lr, t_lr)
+    R, t, t_loss, bbox, bbox_r, losses = refine_pose_stereo_GS(query_info, query_r_info, 
+                                                               gProxy, render_options, R_lr, t_lr)
+    # R, t, t_loss, bbox, bbox_r, losses = refine_pose_stereo_rerender(query_info, query_r_info, 
+    #                                                                  gProxy, render_options, R_lr, t_lr)
     t_refine = sync_time()
 
     # Summary print
@@ -1422,9 +1424,10 @@ def main_object_pose_estimation():
         vis_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(vis_path), cv2.cvtColor(comp_img, cv2.COLOR_RGB2BGR))
 
+        gaussian_proxy.set_T(R, t)
         pose_img = make_pose_validation_image(query, gaussian_proxy, q_bbox, 3.0)
         vis_path = obj_out_dir / "result" / f"{fnstem}_pose_valid.png"
-        # cv2.imwrite(str(vis_path), cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(vis_path), cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
 
         if USE_STEREO:
             R_r = R_lr.detach().cpu().numpy() @ R
@@ -1438,6 +1441,11 @@ def main_object_pose_estimation():
             vis_path = obj_out_dir / "result" / f"{fnstem[:-1]}R_comp.png"
             vis_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(vis_path), cv2.cvtColor(comp_img, cv2.COLOR_RGB2BGR))
+
+            gaussian_proxy.set_T(R_r, t_r)
+            pose_img = make_pose_validation_image(query_r, gaussian_proxy, q_bbox_r, 3.0)
+            vis_path = obj_out_dir / "result" / f"{fnstem[:-1]}R_pose_valid.png"
+            cv2.imwrite(str(vis_path), cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
 
         if USE_STEREO:
             np.save( obj_out_dir / "result" / f"{fnstem[:-1]}.npy", losses )
