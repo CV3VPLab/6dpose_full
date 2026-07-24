@@ -1,0 +1,90 @@
+{
+    "input_femto_bolt": {
+        "type": "dir",  
+        "name": "00001.jpg",
+        "cam_type": "femto_bolt",
+        "K_filename": "intrinsics_ds.txt"
+    },
+    "input_zed_m": {
+        "type": "dir",  
+        "name": "00001.jpg",
+        "cam_type": "zed_m",
+        "K_filename": "calibration.json"
+    },
+    "object": "can_mtdew"
+    ,
+    "detector": {
+        "name": "yolo",
+        "weights": "weights/best_3cls_v2.pt",
+        "options": {
+            "conf_thr": 0.25
+        }
+    },
+    "segmentator": {
+        "name": "sam2",
+        "weights": "weights/sam2.1_hiera_tiny.pt",
+        "options": {
+            "repo": "sam2_repo",
+            "config": "configs/sam2.1/sam2.1_hiera_t.yaml"
+        }
+        
+    },
+    "feat_extractor": {
+        "name": "DINOv2",
+        "options": {
+            "model": "dinov2_vits14",
+            "input_size": 224,
+            "onnx": "weights/dino_vits14_224.onnx",
+            "trt_cache_dir": "weights/trt_cache",
+            "warmup": true,
+            "warmup_runs": 1,
+            "require_gpu": true
+        }
+
+    },
+    "matcher": {
+        "name": "EDM_TRT",
+        "onnx": "weights/edm_outdoor_w672_h672_topk2469.onnx",
+        "trt_cache_dir": "weights/trt_cache",
+        "options": {
+            "conf_thr": 0.5,
+            "input_size": 672,
+            "warmup": true,
+            "warmup_runs": 1,
+            "require_gpu": true
+        }
+    },
+    "pnp": {
+        "reproj_thr": 4.0
+    },
+    "renderer": {
+        "name": "3dgs",
+        "options": {
+            "width": 1920,
+            "height": 1080,
+            "background": [255,0,255],
+            "sh_degree": 3,
+            "iters": 70,
+            "lr_rot": 2e-3,
+            "lr_trans": 3e-3,
+            "warmup_steps": 7,
+            "early_stop_steps": 20,
+            "early_stop_thr": 1e-5
+        }
+    },
+    "comments": [
+        "input - type: [file, dir, cam]",
+        "               file: a single image file",
+        "               dir: image files in dir",
+        "               cam: image from a cam",
+        {
+            "name": "LoFTR",
+            "options": {
+                "pretrained": "outdoor",
+                "conf_thr": 0.5,
+                "input_size": 840
+            }
+        }
+    ]
+}
+

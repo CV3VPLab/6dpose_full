@@ -14,6 +14,25 @@
                 "--config", "ope_config.json"
             ]
         },
+        {
+            "name": "Evaluate pose against GT",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/evaluate_pose_gt.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--gt", "data/output/can_mtdew/result_gt/refined_poses.json",        // 자세 추정 GT 결과 경로
+                "--estimate", "data/output/can_mtdew/result/refined_poses.json",     // 자세 추정 결과 경로
+                "--gt-camera", "zed2i_1_L",                                          // 기준 카메라, 현재는 2개의 zed2i 카메라 중 zed2i_1_L로 설정
+                "--estimate-camera", "femto_color",                                  // 기준 카메라를 제외한 자세 추정 메인 카메라
+                "--calibration", "data/camera_calibration.json",                     // 카메라 간 calibration 결과, 기준 카메라와 자세 추정 카메라 간 관계 추출
+                "--calibration-translation-unit", "cm",
+                "--model-ply", "data/object/can_mtdew/model/point_cloud.ply",
+                "--model-unit", "m",
+                "--output-dir", "data/output/can_mtdew/evaluation/zed2i_1_R"
+            ]
+        },
         {   "name": "Step 1: Object detection & segmentation from query image",
             "type": "debugpy",
             "request": "launch",
@@ -33,6 +52,22 @@
                 "--use_manual_fallback"
             ]
         },
+        {   "name": "Generate gallery poses",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/generate_gallery_poses.py",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "args": [
+                "--out_dir", "data",
+                "--subdivisions", "2",
+                "--radius", "0.5,0.6,0.7,0.8",
+                "--roll_scheme", "level2_close_rolls",
+                "--min_elevation_deg", "-90",
+                "--max_elevation_deg", "90",
+                "--preview_size", "900"
+            ]
+        },
         {   "name": "Step 4: Rendering gallery",
             "type": "debugpy",
             "request": "launch",
@@ -46,7 +81,7 @@
                 "--intrinsics_path", "data/camera/femto_bolt/intrinsics_ds.txt",
                 "--width", "1920",
                 "--height", "1080",
-                "--background", "0,0,0",                
+                "--background", "0,0,0",                // black; for pink use "--background", "255,0,255"
                 "--sh_degree", "3",
                 "--gs_mode", "3dgs",
                 "--dino_model", "dinov2_vits14",
