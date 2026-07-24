@@ -228,7 +228,8 @@ def solve_pose_pnp(pts2d, pts3d, K, R0,
         return R0, t_linear, "linear_T_fixed_R", 0, np.inf, np.array([], dtype=np.int32)
 
     inlier_idx = inliers.ravel().astype(np.int32)
-    print(f"  [ePnP] Stage 1 : {len(inlier_idx)} inliers / {N} pts")
+    pose_str = ""  # f", rvec: {rvec.squeeze()}, tvec: {tvec.squeeze()}"
+    print(f"  [ePnP] Stage 1 : {len(inlier_idx)} inliers / {N} pts{pose_str}")
 
     assert len(inlier_idx) >= N_MIN_PTS, f"  [PnP] Stage 1 inliers {len(inlier_idx)} < {N_MIN_PTS}, pose refinement skipped"
     
@@ -242,8 +243,9 @@ def solve_pose_pnp(pts2d, pts3d, K, R0,
         useExtrinsicGuess=True,
         flags=cv2.SOLVEPNP_ITERATIVE,
     )
+    pose_str = ""  # f", rvec: {rvec.squeeze()}, tvec: {tvec.squeeze()}"
     if retval:
-        print(f"  [PnP] Stage 2 (ITERATIVE refine on {len(inlier_idx)} inliers): OK")
+        print(f"  [PnP] Stage 2 (ITERATIVE refine on {len(inlier_idx)} inliers): OK{pose_str}")
     else:
         print(f"  [PnP] Stage 2 refine failed, using Stage 1 result")
 

@@ -4,6 +4,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import open3d as o3d
+import cv2
+
+
+def Rt2T(R, t):
+    """R: [3,3], t: [3]"""
+    T = torch.eye(4, dtype=R.dtype, device=R.device)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
+def T2Rt(T):
+    """T: [4,4]"""
+    R = T[:3, :3]
+    t = T[:3, 3]
+    return R, t
 
 
 def rotation_matrix_to_quaternion(R):
@@ -70,6 +86,26 @@ def depth_to_xyz_map(depth_np, fx, fy, cx, cy, R_obj_to_cam, t_obj_to_cam):
     return xyz_obj
 
 
+def depth_tensor_to_xyz_map2(depth_hw, mask_hw, sx, sy, fx, fy, cx, cy, R, t):
+    vv, uu = torch.where(mask_hw)
+    u, v = uu.float(), vv.float()
+    u += sx - cx
+    v += sy - cy
+    
+    Z = depth_hw[mask_hw]
+    
+    Xc = u * Z / fx
+    Yc = v * Z / fy
+
+    # xyz_cam: chw
+    xyz_cam = torch.stack([Xc, Yc, Z], dim=0)   # [H,W,3]
+    xyz_obj = torch.zeros_like(xyz_cam, dtype=torch.float32)
+
+    # Xc = R Xo + t  ->  Xo = R^T (Xc - t)
+    xyz_obj = R.T @ (xyz_cam - t.unsqueeze(1))
+
+    return xyz_obj
+
 def depth_tensor_to_xyz_map(depth_hw: torch.Tensor, fx, fy, cx, cy, R: torch.Tensor, t: torch.Tensor):
     device = depth_hw.device
     H, W = depth_hw.shape
@@ -96,6 +132,22 @@ def depth_tensor_to_xyz_map(depth_hw: torch.Tensor, fx, fy, cx, cy, R: torch.Ten
 
     xyz_obj[:, valid] = pts_obj_valid
     return xyz_obj, valid
+
+
+def depth_sample_to_xyz(depth: np.ndarray, pts2d: np.ndarray, 
+                        K: np.ndarray, R: np.ndarray, t: np.ndarray):
+    assert depth.ndim == 2
+
+    uu = pts2d[:,0] - K[0,2]
+    vv = pts2d[:,1] - K[1,2]
+    Z = cv2.remap(depth, pts2d[:,0], pts2d[:,1], interpolation=cv2.INTER_LINEAR).squeeze()        
+    Xc = uu * Z / K[0,0]
+    Yc = vv * Z / K[1,1]
+    xyz_cam = np.concatenate((Xc[:,np.newaxis], Yc[:,np.newaxis], Z[:,np.newaxis]), axis=1)
+    # xyz_cam & xyz_obj: [N, 3]
+    xyz_obj = (xyz_cam - t[np.newaxis, :]) @ R
+    
+    return xyz_obj
 
 
 """
@@ -145,6 +197,14 @@ def unproject(depth, K, c2w, mask, rgb, depth_max=None):
         rgb = rgb / 255.0
     cols = rgb[valid]
     return pts_world, cols
+
+
+def is_valid_point3d(pts3d: np.ndarray):
+    assert pts3d.shape[1] == 3
+    # finite check
+    finite = np.all(np.isfinite(pts3d), axis=1)
+    nonzero = np.abs(pts3d).sum(axis=1) > 1e-6
+    return finite & nonzero
 
 
 def mesh_from_depth_grid(pts_world, valid, rgb, z, edge_thresh=0.05):

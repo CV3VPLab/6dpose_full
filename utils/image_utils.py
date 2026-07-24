@@ -98,7 +98,7 @@ def square_bbox(bbox, bbox_size):
 
 
 def get_bbox_size(bbox):
-    return max(bbox[2]-bbox[0], bbox[3]-bbox[1])
+    return bbox[2]-bbox[0], bbox[3]-bbox[1]
 
  
 def get_max_bbox_size(bboxes):
@@ -133,18 +133,17 @@ def zeropad_square(img, side):
     return canvas, (sx, sy)
 
 
-def unmap_from_square_resize(pts_resized, orig_hw, resize_target):
+def unmap_from_square_resize(pts_resized, orig_hw, resized_size):
     h, w = orig_hw
     side = max(h, w)
     x0 = (side - w) // 2
     y0 = (side - h) // 2
-    pts_square = pts_resized * (side / resize_target)
+    pts_square = pts_resized * (side / resized_size)
     return pts_square - np.array([[x0, y0]], dtype = pts_resized.dtype)
 
 
-def unmap_to_full_image(pts_crop, bbox, resize_target):
-    pts_unscaled = unmap_from_square_resize(pts_crop, (bbox[3]-bbox[1], bbox[2]-bbox[0]), resize_target)
-    return pts_unscaled + np.array([[bbox[0], bbox[1]]], dtype=pts_crop.dtype)
+def unmap_to_full_image(pts_crop, bbox):
+    return pts_crop + np.array([[bbox[0], bbox[1]]], dtype=pts_crop.dtype)
 
 
 def apply_mask(image, mask):
@@ -261,7 +260,7 @@ def render_to_image(render):
 
 
 def np_to_tensor(innp: np.ndarray, device='cuda'):
-    resT = torch.from_numpy(innp).to(device).float() / 255.0
+    resT = torch.from_numpy(innp).to(device).float()
     if innp.ndim == 3:
         assert innp.shape[2] == 1 or innp.shape[2] == 3
         resT = resT.permute(2,0,1)
@@ -373,9 +372,9 @@ def compute_gradients(image, filters_x, filters_y):
     grad_y = F.conv2d(image, filters_y, padding=1)
 
     grad_mag = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
-    grad_dir = torch.cat([grad_x, grad_y], dim=1) / (grad_mag + 1e-6)
+    # grad_dir = torch.cat([grad_x, grad_y], dim=1) / (grad_mag + 1e-6)
 
-    return grad_mag, grad_dir
+    return grad_mag #, grad_dir
 
 
 def erode_binary_tensor(img_tensor, kernel_size=3):
@@ -384,13 +383,8 @@ def erode_binary_tensor(img_tensor, kernel_size=3):
     """
     pad = kernel_size // 2
     
-    # 1. 0과 1을 반전시킵니다.
     inv_tensor = 1.0 - img_tensor
-    
-    # 2. 반전된 이미지에 Max Pooling (Dilation 효과)
     dilated_inv = F.max_pool2d(inv_tensor, kernel_size, stride=1, padding=pad)
-    
-    # 3. 다시 반전시켜서 Erosion 결과 획득
     eroded_tensor = 1.0 - dilated_inv
     
     return eroded_tensor
@@ -425,57 +419,17 @@ def iou_loss(pred, target, smooth=1e-6):
     return 1. - iou_score
 
 
-class FFTLoss(nn.Module):
-    def __init__(self, loss_type='l1'):
-        super(FFTLoss, self).__init__()
-        self.loss_type = loss_type
-
-    def forward(self, pred, target):
-        pred_fft = torch.fft.fft2(pred, norm='ortho')
-        target_fft = torch.fft.fft2(target, norm='ortho')
-
-        if self.loss_type == 'l1':
-            pred_real_imag = torch.view_as_real(pred_fft)
-            target_real_imag = torch.view_as_real(target_fft)
-
-            loss = F.l1_loss(pred_real_imag, target_real_imag)
-
-        elif self.loss_type == 'magnitude':
-            diff = pred_fft - target_fft
-            loss = torch.mean(torch.abs(diff))
-
-        else:
-            raise ValueError("loss_type must be 'l1' or 'magnitude'")
+def gradient_matching_loss(render_img, query_img, mask=None):
+    if not hasattr(gradient_matching_loss, "filters_x"):
+        device = render_img.device
+        filters_x, filters_y = get_gradient_filters(device)
         
-        return loss
+    emask = erode_binary_tensor(mask, 3)
+    render_grad_mag = compute_gradients(render_img, filters_x, filters_y)
+    query_grad_mag = compute_gradients(query_img, filters_x, filters_y)
     
+    mag_loss = F.l1_loss(render_grad_mag * emask, query_grad_mag * emask)    
 
-def gradient_matching_loss(render_img, query_img, alpha=0.5, mask=None):
-    device = render_img.device
-    filters_x, filters_y = get_gradient_filters(device)
-    emask = erode_binary_tensor(mask.unsqueeze(0), 3).squeeze(0)
-    render_grad_mag, render_grad_dir = compute_gradients(render_img.unsqueeze(0), filters_x, filters_y)
-    query_grad_mag, query_grad_dir = compute_gradients(query_img.unsqueeze(0), filters_x, filters_y)
-    
-    mag_loss = F.l1_loss(render_grad_mag * emask, query_grad_mag * emask)
-    cos_sim = F.cosine_similarity(render_grad_dir, query_grad_dir, dim=1)
-    dir_loss = (1 - cos_sim).mean()
-    total_loss = (1 - alpha) * mag_loss + alpha * dir_loss
+    return mag_loss
 
-    return total_loss, mag_loss, dir_loss
-
-class GradientPriorLoss(nn.Module):
-    def __init__(self, alpha=0.8, eps=1e-6):
-        super(GradientPriorLoss, self).__init__()
-        self.alpha = alpha
-        self.eps = eps
-
-    def forward(self, pred):
-        dx = pred[:,:,:,1:] - pred[:,:,:,:-1]
-        dy = pred[:,:,1:,:] - pred[:,:,:-1,:]
-        loss_dx = torch.mean((torch.abs(dx) + self.eps) ** self.alpha)
-        loss_dy = torch.mean((torch.abs(dy) + self.eps) ** self.alpha)
-
-        return loss_dx + loss_dy
-    
 

@@ -22,20 +22,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from gaussian_renderer import GaussianModel
 from gsplat import rasterization as _gsplat_rasterize_3dgs
 from gsplat import rasterization_2dgs as _gsplat_rasterize_2dgs
 
 from utils.image_utils import construct_queryInfo, get_bbox_size, square_bbox, crop_with_bbox, apply_mask
+from utils.image_utils import tensor_to_np as t2np, np_to_tensor as np2t, npfloat_to_image as npf2img
+
 from utils.io_utils import (
     ensure_dir, save_json, load_json, 
     load_intrinsics, K_to_params, 
     resolve_ply_path
 )
+from utils.geom_utils import Rt2T, T2Rt
 
 def _rasterize(means, quats, scales, opacities, colors, viewmats, Ks,
-               width, height, sh_degree, near_plane, far_plane, backgrounds, packed):
+               width, height, sh_degree, near_plane, far_plane, backgrounds, packed, render_mode):
     """Unified rasterizer: auto-detects 2DGS (scales dim=2) vs 3DGS (scales dim=3)."""
     if scales.shape[-1] == 2:
         pad = torch.full((*scales.shape[:-1], 1), 1e-10,
@@ -46,7 +50,7 @@ def _rasterize(means, quats, scales, opacities, colors, viewmats, Ks,
             colors=colors, viewmats=viewmats, Ks=Ks,
             width=width, height=height, sh_degree=sh_degree,
             near_plane=near_plane, far_plane=far_plane,
-            backgrounds=backgrounds, packed=packed,
+            backgrounds=backgrounds, packed=packed, render_mode=render_mode
         )
         return out[0], out[1], out[-1]   # renders, alphas, meta
     else:
@@ -55,7 +59,7 @@ def _rasterize(means, quats, scales, opacities, colors, viewmats, Ks,
             colors=colors, viewmats=viewmats, Ks=Ks,
             width=width, height=height, sh_degree=sh_degree,
             near_plane=near_plane, far_plane=far_plane,
-            backgrounds=backgrounds, packed=packed,
+            backgrounds=backgrounds, packed=packed, render_mode=render_mode
         )
 
 
@@ -351,36 +355,33 @@ def rotation_matrix_to_euler_xyz_deg(R):
     return np.degrees([x,y,z])
 
 
-# ──────────────────────────────────────────────────────────
-# RigidPoseGaussianProxy  (변환된 Gaussian을 differentiable하게 wrap)
-# ──────────────────────────────────────────────────────────
-class RigidPoseGaussianProxy:
+
+
+
+class GaussianRenderer:
     """
-    GaussianModel을 rigid transform (R, t)으로 감싸는 proxy.
-    Gaussians 자체는 고정, pose 파라미터(delta_r, delta_t)를 통해 gradient 흐름.
-    GS-Pose와 달리 delta를 내부에 넣지 않고 외부에서 주입하는 방식.
+    GaussianModel을 다수의 view matrices로 렌더링하는 유틸리티 클래스
+    기본 view matrix는 R, t로 설정되고, 추가 view matrix는 기준 + Rx, +Ry, +Rz, -Tz를 추가
     """
-    def __init__(self, base, R_obj2cam, t_obj2cam, K=None, bg_val=None):
+    def __init__(self, base, K=None, bg_val=None, width=None, height=None, perturbation=False):
         self.base = base
-        if isinstance(R_obj2cam, np.ndarray):
-            R_obj2cam = self.toGPUTensor(R_obj2cam)
-        if isinstance(t_obj2cam, np.ndarray):
-            t_obj2cam = self.toGPUTensor(t_obj2cam)
-        self.R = R_obj2cam   # [3,3] torch
-        self.t = t_obj2cam   # [3] torch
         self.active_sh_degree = base.active_sh_degree
         self.max_sh_degree    = base.max_sh_degree
+        self.stereo = False
 
-        # Pre-compute gsplat render constants (identity viewmat + K)
-        self.viewmat = torch.eye(4, dtype=torch.float32, device='cuda').unsqueeze(0)  # (1,4,4)
         if K is not None:
-            self.K_mat = torch.tensor(K, dtype=torch.float32, device='cuda').unsqueeze(0)  # (1,3,3)
+            self.K_mat = self.toGPUTensor(K[np.newaxis, :, :])
         if bg_val is not None:
-            self.bg = torch.tensor(bg_val, dtype=torch.float32, device='cuda').unsqueeze(0)  # (1,3)
+            self.bg = self.toGPUTensor(bg_val[np.newaxis, :])
+        if width is not None:
+            self.width = width
+        if height is not None:
+            self.height = height
+        self.perturbation = perturbation
 
     @property
     def get_xyz(self):
-        return self.base.get_xyz @ self.R.transpose(0,1) + self.t.unsqueeze(0)
+        return self.base.get_xyz
 
     @property
     def get_opacity(self):
@@ -396,11 +397,7 @@ class RigidPoseGaussianProxy:
 
     @property
     def get_rotation(self):
-        q_base = self.base.get_rotation   # [N,4] wxyz
-        q_pose = rotation_matrix_to_quaternion_wxyz_torch(self.R)  # [4]
-        q_pose = q_pose.unsqueeze(0).expand(q_base.shape[0], 4)
-        q_new  = quaternion_multiply_wxyz(q_pose, q_base)
-        return q_new / (torch.norm(q_new, dim=1, keepdim=True) + 1e-12)
+        return self.base.get_rotation   # [N,4] wxyz        
 
     def get_covariance(self, scaling_modifier=1.0):
         return self.base.get_covariance(scaling_modifier)
@@ -408,7 +405,6 @@ class RigidPoseGaussianProxy:
     def get_exposure_from_name(self, image_name):
         return self.base.get_exposure_from_name(image_name)
     
-    # KSCHOI added
     def set_T(self, R, t):
         if isinstance(R, np.ndarray):
             R = self.toGPUTensor(R)
@@ -416,36 +412,107 @@ class RigidPoseGaussianProxy:
             t = self.toGPUTensor(t)
         self.R = R
         self.t = t
+        self.viewmats = self.get_viewmats()
+
+    def set_T_lr(self, R_lr, t_lr):
+        if isinstance(R_lr, np.ndarray):
+            R_lr = self.toGPUTensor(R_lr)
+        if isinstance(t_lr, np.ndarray):
+            t_lr = self.toGPUTensor(t_lr)
+        self.R_lr = R_lr
+        self.t_lr = t_lr     
+        self.stereo = True   
 
     def get_T(self):
         return self.R, self.t
     
-    def set_K(self, K):
-        self.K_mat = torch.tensor(K, dtype=torch.float32, device='cuda').unsqueeze(0)  # (1,3,3)
-
-    def set_resolution(self, width, height):
-        self.width = width
-        self.height = height
-
     def toGPUTensor(self, arr):
         return torch.tensor(arr.astype(np.float32), dtype=torch.float32, device='cuda')
     
-    def render(self, width=None, height=None):
-        if width is None:
-            assert hasattr(self, "width")
-            width = self.width
-        if height is None:
-            assert hasattr(self, "height")
-            height = self.height
+    def get_viewmats(self, dra = 3.0, dtz = -0.005):
+        # dra: increment in rotational angle (degrees)
+        # dtz: decrement in z translation (5mm closer)
+        device = self.R.device
 
+        assert hasattr(self, "R")
+        assert hasattr(self, "t")        
+        R, t = self.R, self.t
+
+        num_views = 5 if self.perturbation else 1
+        
+        if self.stereo:
+            assert hasattr(self, "R_lr")
+            assert hasattr(self, "t_lr")
+            num_cams = 2
+            R_r, t_r = (self.R_lr @ R), (self.R_lr @ t + self.t_lr)
+        else:
+            num_cams = 1
+
+        viewmats = torch.zeros((num_views*num_cams, 4, 4), dtype=torch.float32, device=device)            
+        viewmats[0] = Rt2T(R, t)
+        
+        if self.perturbation:
+            dr = np.deg2rad(dra)
+            cos_r, sin_r = np.cos(dr), np.sin(dr)
+            self.Rx = torch.tensor([[1, 0, 0],[0, cos_r, -sin_r], [0, sin_r, cos_r]], device=device, dtype=torch.float32)
+            self.Ry = torch.tensor([[cos_r, 0, sin_r],[0, 1, 0], [-sin_r, 0, cos_r]], device=device, dtype=torch.float32)
+            self.Rz = torch.tensor([[cos_r, -sin_r, 0],[sin_r, cos_r, 0], [0, 0, 1]], device=device, dtype=torch.float32)
+            self.tz = torch.tensor([0, 0, dtz], device=device, dtype=torch.float32)
+            
+            viewmats[1] = Rt2T(self.Rx @ R, t)
+            viewmats[2] = Rt2T(self.Ry @ R, t)
+            viewmats[3] = Rt2T(self.Rz @ R, t)
+            viewmats[4] = Rt2T(R, t + self.tz)
+
+        if num_cams == 2:   # Stereo
+            viewmats[num_views] = Rt2T(R_r, t_r)
+            if self.perturbation:
+                viewmats[num_views+1] = Rt2T(self.Rx @ R_r, t_r)
+                viewmats[num_views+2] = Rt2T(self.Ry @ R_r, t_r)
+                viewmats[num_views+3] = Rt2T(self.Rz @ R_r, t_r)
+                viewmats[num_views+4] = Rt2T(R_r, t_r + self.tz)
+
+        return viewmats
+    
+    def render(self, render_mode=None):
+        assert hasattr(self, "viewmats")
+        assert hasattr(self, "width")
+        assert hasattr(self, "height")
+        width = self.width
+        height = self.height
+
+        Ks  = self.K_mat
+        bgs = self.bg
+
+        num_views = 5 if self.perturbation     else 1        
+        num_cams  = 2 if hasattr(self, "R_lr") else 1        
+
+        if num_views*num_cams > 1:
+            Ks = Ks.expand( num_views*num_cams, -1, -1)
+            bgs = bgs.expand( num_views*num_cams, -1)
+
+        render_mode = "RGB" if render_mode is None else render_mode
         return _rasterize(
             means = self.get_xyz, quats=self.get_rotation,
             scales = self.get_scaling, opacities=self.get_opacity.squeeze(-1),
-            colors = self.get_features, viewmats=self.viewmat, Ks=self.K_mat,
+            colors = self.get_features, viewmats=self.viewmats, Ks=Ks,
             width = width, height = height,
             sh_degree = int(self.active_sh_degree),
-            near_plane=0.01, far_plane=100.0, backgrounds=self.bg, packed=False
+            near_plane=0.01, far_plane=100.0, backgrounds=bgs, render_mode=render_mode, packed=False
         )
+    
+    def render_no_grad(self, render_mode=None):
+        with torch.no_grad():
+            return self.render(render_mode)
+        
+    def render_perturbed_no_grad(self, render_mode=None):
+        assert hasattr(self, "width")
+        assert hasattr(self, "height")
+        width = self.width
+        height = self.height
+        
+        render_mode = "RGB" if render_mode is None else render_mode
+
 
 
 # ──────────────────────────────────────────────────────────
@@ -482,13 +549,13 @@ def simple_ms_ssim(x, y, levels=3):
 
 def dssim_loss(render, target):
     """D-SSIM = 1 - SSIM"""
-    return 1.0 - simple_ssim(render.unsqueeze(0), target.unsqueeze(0))
+    return 1.0 - simple_ssim(render, target)
 
 def dms_ssim_loss(render, target):
     """D-MS-SSIM = 1 - MS-SSIM"""
-    return 1.0 - simple_ms_ssim(render.unsqueeze(0), target.unsqueeze(0))
+    return 1.0 - simple_ms_ssim(render, target)
 
-
+    
 # ──────────────────────────────────────────────────────────
 # Learning rate scheduler with warmup (cosine annealing)
 # ──────────────────────────────────────────────────────────
@@ -571,7 +638,7 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
     query_info = construct_queryInfo(args.query_img, output_dir)
 
     q_bbox = np.array(query_info["bbox"])
-    q_side = get_bbox_size(q_bbox)
+    q_side = max(get_bbox_size(q_bbox))
     q_bbox_ext = square_bbox(q_bbox, int(q_side * 1.2) )
 
     print(f"[Crop] query mask bbox : {q_bbox} -> {q_bbox_ext}")
@@ -604,7 +671,7 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
     # ── sanity render (init pose) — skipped in rt_mode ──
     best_render_np = None    
     with torch.no_grad():
-        proxy_init = RigidPoseGaussianProxy(gaussians, init_R_t, init_t_t)
+        proxy_init = GaussianRenderer(gaussians, init_R_t, init_t_t)
         _r, _, _ = _rasterize(
             means=proxy_init.get_xyz, quats=proxy_init.get_rotation,
             scales=proxy_init.get_scaling, opacities=proxy_init.get_opacity.squeeze(-1),
@@ -682,7 +749,7 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
         ])
 
         # full resolution render with identity cam (gsplat)
-        proxy = RigidPoseGaussianProxy(gaussians, R_cur, t_cur)
+        proxy = GaussianRenderer(gaussians, R_cur, t_cur)
 
         _r, _, _ = _rasterize(
             means=proxy.get_xyz, quats=proxy.get_rotation,
@@ -704,7 +771,8 @@ def run_refine_pose(args, gaussians=None, rt_mode=False):
         loss_mask = F.l1_loss(render_alpha, query_mask)
 
         # 2. RGB Loss (SSIM, L1)
-        loss_ssim = dssim_loss(render_crop, query_crop) + dms_ssim_loss(render_crop, query_crop)
+        loss_ssim = dssim_loss(render_crop.unsqueeze(0), query_crop.unsqueeze(0)) 
+        loss_ssim += dms_ssim_loss(render_crop.unsqueeze(0), query_crop.unsqueeze(0))
         loss_l1_rgb = F.l1_loss(render_crop, query_crop)
 
         # 3. Blur Loss

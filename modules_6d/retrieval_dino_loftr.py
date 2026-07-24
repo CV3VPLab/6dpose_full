@@ -26,6 +26,7 @@ from utils.image_utils import (
     square_bbox,
     square_pad_resize,
     zeropad_square,
+    unmap_from_square_resize,
     unmap_to_full_image,
     get_mask_inlier_indices,
     construct_queryInfo,
@@ -116,8 +117,10 @@ def draw_loftr_matches_full(img0_full, img1_full,
                             out_path,
                             loftr_size=840, max_draw=400):
 
-    m0_full = unmap_to_full_image(mkpts0_crop, q_bbox, loftr_size)
-    m1_full = unmap_to_full_image(mkpts1_crop, g_bbox, loftr_size)
+    mkpts0_crop = unmap_from_square_resize(mkpts0_crop, (q_bbox[3]-q_bbox[1], q_bbox[2]-q_bbox[0]), loftr_size)
+    mkpts1_crop = unmap_from_square_resize(mkpts1_crop, (g_bbox[3]-g_bbox[1], g_bbox[2]-g_bbox[0]), loftr_size)
+    m0_full = unmap_to_full_image(mkpts0_crop, q_bbox)
+    m1_full = unmap_to_full_image(mkpts1_crop, g_bbox)
 
     h0, w0 = img0_full.shape[:2]
     h1, w1 = img1_full.shape[:2]
@@ -226,7 +229,8 @@ def retrieve_match(query_info, gallery_info, feat_extractor_info, matcher_info, 
         start_time = time.perf_counter()
     
     mkpts0, mkpts1, conf = compute_loftr_matches(matcher, query_l, gallery_l, device=device)
-
+    mkpts0 = unmap_from_square_resize(mkpts0, query_crop.shape[:2], LOFTR_SIZE)
+    mkpts1 = unmap_from_square_resize(mkpts1, gallery_crop.shape[:2], LOFTR_SIZE)
     if TIME_CHECK:
         end_time = time.perf_counter()
         print(f"  LoFTR matching time : {end_time - start_time:.6f} seconds")
@@ -235,7 +239,8 @@ def retrieve_match(query_info, gallery_info, feat_extractor_info, matcher_info, 
     mkpts0, mkpts1, conf = mkpts0[valid], mkpts1[valid], conf[valid]
 
     # 마스크 필터링: query crop coords → full image coords → mask 체크
-    pts0_full = unmap_to_full_image(mkpts0, q_bbox_ext, LOFTR_SIZE)
+    
+    pts0_full = unmap_to_full_image(mkpts0, q_bbox_ext)
     mask_keep = get_mask_inlier_indices(pts0_full, query_mask)
 
     mkpts0 = mkpts0[mask_keep]
@@ -243,7 +248,7 @@ def retrieve_match(query_info, gallery_info, feat_extractor_info, matcher_info, 
     conf   = conf[mask_keep]
 
     pts0_full = pts0_full[mask_keep]
-    pts1_full = unmap_to_full_image(mkpts1, g_bbox_ext, LOFTR_SIZE)
+    pts1_full = unmap_to_full_image(mkpts1, g_bbox_ext)
 
     # crop 공간 시각화
     if out_dir is not None:

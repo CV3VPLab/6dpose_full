@@ -88,7 +88,7 @@ def render_with_gsplat(gaussians, R_obj_to_cam, t_obj_to_cam,
                        bg_color_str="0,0,0", device="cuda",
                        render_depth=False):
     """
-    Render a GaussianModel (or RigidPoseGaussianProxy) with gsplat.
+    Render a GaussianModel (or GaussianRenderer) with gsplat.
 
     When R_obj_to_cam is None, uses identity viewmat (the proxy has already
     applied the pose transform to the Gaussian positions).
