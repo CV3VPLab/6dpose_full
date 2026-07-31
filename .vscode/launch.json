@@ -74,20 +74,18 @@
             "program": "render_gallery.py",
             "console": "integratedTerminal",
             "cwd":"${workspaceFolder}",
-            "args": [
-                "--out_dir", "data/output/can_mtdew",
-                "--model_dir", "data/object/can_mtdew/model",
+            "args": [                
+                "--obj_dir", "data/object/usb_4",
                 "--gallery_pose_json", "data/gallery_poses.json",
-                "--intrinsics_path", "data/camera/femto_bolt/intrinsics_ds.txt",
+                "--intrinsics_path", "data/camera/zed_m/calibration.json", // "data/camera/femto_bolt/intrinsics_ds.txt",
                 "--width", "1920",
                 "--height", "1080",
                 "--background", "0,0,0",                // black; for pink use "--background", "255,0,255"
                 "--sh_degree", "3",
                 "--gs_mode", "3dgs",
                 "--dino_model", "dinov2_vits14",
-                "--dino_input_size", "224",
-                "--save_depth",
-                "--save_xyz",              
+                "--dino_input_size", "224",                
+                "--save_xyz",                           // "--save_depth",
             ]
         },
         {   "name": "Step 5: Retrieve gallery & Feature Matching",
@@ -160,6 +158,14 @@
                 "--crop_margin_scale",  "1.3",
                 "--rt_mode"
             ]
+        },
+        {
+            "name": "run this py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}"
         }
     ]
 }

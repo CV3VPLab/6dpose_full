@@ -11,13 +11,13 @@
         "cam_type": "zed_m",
         "K_filename": "calibration.json"
     },
-    "objects": ["can_mtdew", "drill_yellow", "usb_3"]
+    "objects": [["can_mtdew", 0.995], ["can_fanta", 0.995], ["drill_yellow", 1.012], ["usb_4", 1.0]]
     ,
-    "object": "can_mtdew"
+    "object": 0
     ,
     "detector": {
         "name": "yolo",
-        "weights": "weights/best_3cls_v2.pt",
+        "weights": "weights/best.pt",
         "options": {
             "conf_thr": 0.25
         }
@@ -49,7 +49,7 @@
         "onnx": "weights/edm_outdoor_w672_h672_topk2469.onnx",
         "trt_cache_dir": "weights/trt_cache",
         "options": {
-            "conf_thr": 0.5,
+            "conf_thr": 0.35,
             "input_size": 672,
             "warmup": true,
             "warmup_runs": 1,
@@ -61,21 +61,22 @@
     },
     "renderer": {
         "name": "3dgs",
-        "options": {
+        "options": {            
             "width": 1920,
             "height": 1080,
             "background": [0,0,0],
-            "sh_degree": 3,
-            "iters": 100,
+            "sh_degree": 3,            
+            "iters": 40,                
             "lr_rot": 2e-3,
             "lr_trans": 3e-3,
-            "warmup_steps": 10,
+            "warmup_steps": 5,
             "early_stop_steps": 20,
             "early_stop_thr": 1e-5
-        }
+        },
+        "iterations": [[100, 10], [50, 5], [40, 5], [30, 4], [20, 3]]
     },
     "comments": [
-        "input - type: [file, dir, cam]",
+        "input - type: [file, dir, cam]",   
         "               file: a single image file",
         "               dir: image files in dir",
         "               cam: image from a cam",

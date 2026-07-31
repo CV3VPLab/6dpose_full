@@ -1,9 +1,11 @@
 %%
 clear all
+
 poses_GS = cell(1,5);
 poses_RR = cell(1,5);
 poses_MX = cell(1,5);
 
+poses_GT = poseEstimAnal('W:\data\output\can_mtdew\result\refined_poses_GT.json');
 disp('  pose GS loading')
 poses_GS{1} = poseEstimAnal('W:\data\output\can_mtdew\result\refined_poses_GS_100.json');
 poses_GS{2} = poseEstimAnal('W:\data\output\can_mtdew\result\refined_poses_GS_50.json');

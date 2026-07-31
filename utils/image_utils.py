@@ -18,6 +18,8 @@ import torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
 from .io_utils import load_json
+import matplotlib.pyplot as plt
+
 
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
@@ -144,6 +146,16 @@ def unmap_from_square_resize(pts_resized, orig_hw, resized_size):
 
 def unmap_to_full_image(pts_crop, bbox):
     return pts_crop + np.array([[bbox[0], bbox[1]]], dtype=pts_crop.dtype)
+
+
+def get_specular_mask(img_rgb):
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    lower_bound = np.array([0, 0, 200])
+    upper_bound = np.array([180, 40, 255])
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)    
+    mask = cv2.inRange(hsv, lower_bound, upper_bound)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
 
 
 def apply_mask(image, mask):
@@ -288,12 +300,17 @@ def tensor_to_image(tensor: torch.Tensor):
     return npfloat_to_image(tensor_to_np(tensor))
 
 
+def imshow_tensor(tensor: torch.Tensor):
+    plt.imshow( tensor_to_np(tensor) )
+
+
 def get_boundary(binimg: np.ndarray):
     if not hasattr(get_boundary, "kernel"):
         get_boundary.kernel = np.ones((3, 3), np.uint8)
 
     eimg = cv2.erode(binimg, get_boundary.kernel, iterations=1)
     return binimg - eimg
+
 
 def bin_to_color(binimg: np.ndarray, color):
     assert len(color) == 3
@@ -352,6 +369,7 @@ def draw_contour(img: np.ndarray, mask: np.ndarray, color=(0,255,0), thickness=1
         mask = mask.astype(np.uint8) * 255        
     contour, _ = cv2.findContours( mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
     cv2.drawContours(img, contour, -1, color, thickness)
+
 
 def get_gradient_filters(device='gpu'):
     sobel_x = torch.tensor([[-1., 0., 1.],

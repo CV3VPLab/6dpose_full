@@ -57,19 +57,18 @@ from utils.image_utils import (
     load_rgb, render_to_image,
     expand_bbox, compute_bbox, get_bbox_size, square_bbox, crop_with_bbox, square_pad_resize, unmap_to_full_image,     
     make_gallery_square, construct_galleryInfo, 
-    apply_mask, get_mask_inlier_indices,
+    get_specular_mask, apply_mask, get_mask_inlier_indices,
     erode_binary_tensor,    
-    scale_image_draw_maskcontour, draw_contour,
+    scale_image_draw_maskcontour, draw_contour, imshow_tensor,
     dice_loss, gradient_matching_loss
 )
-from utils.image_utils import tensor_to_np as t2np, np_to_tensor as np2t, npfloat_to_image as npf2img
+from utils.image_utils import tensor_to_np as t2np, np_to_tensor as np2t
 
 from gaussian_renderer import GaussianModel
-from render_gallery import render_with_gsplat
 from utils.geom_utils import (
     depth_tensor_to_xyz_map, depth_tensor_to_xyz_map2, depth_sample_to_xyz, 
     is_valid_point3d,
-    Rt2T, T2Rt, mesh_from_depth_grid
+    T2Rt, mesh_from_depth_grid
 )
 
 
@@ -215,8 +214,10 @@ def get_query_paths(config):
     config_input = config["input"]
     assert config_input["type"] == "file" or config_input["type"] == "dir"
 
+    obj_num = config["object"]
+    obj_name = config["objects"][obj_num][0]
     file_path = Path("data/object")
-    file_path = file_path / config["object"] / "query"
+    file_path = file_path / obj_name / "query"
 
     if config_input["type"] == "file":
         return [file_path / config_input["name"]]
@@ -232,8 +233,10 @@ def get_query(config):
     config_input = config["input"]
     assert config_input["type"] == "file" or config_input["type"] == "dir"
 
+    obj_num = config["object"]
+    obj_name = config["objects"][obj_num][0]
     file_path = Path("data/object")
-    file_path = file_path / config["object"] / "query"
+    file_path = file_path / obj_name / "query"
     
     if config_input["type"] == "file":
         image = load_rgb(file_path / config_input["name"])
@@ -248,12 +251,12 @@ def get_query(config):
 
 
 def get_obj_path(obj_name, kind):
-    # kind : {"output", "gallery", "xyz", "model"}
-    if kind == "model":
-        return Path("data/object") / obj_name / "model"
-    
-    out_path = Path("data/output") / obj_name
+    # kind : {"output", "object", "gallery", "xyz", "model"}
     if kind == "output":
+        return Path("data/output") / obj_name
+    
+    out_path = Path("data/object") / obj_name
+    if kind == "object":
         return out_path 
     
     return out_path / kind
@@ -283,14 +286,12 @@ def project_obj_axes(K, R, t, axis_len_m=0.1):
     return imgpts
 
 
-def make_comp_image(query, gaussian_proxy:GaussianRenderer, q_bbox, R0, t0):
-    q_crop = crop_with_bbox(query, q_bbox)
-
-    _r, _, _ = gaussian_proxy.render()
-    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
-    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
-    
+def make_comp_image(q_crop, q_mask, q_bbox, gaussian_proxy:GaussianRenderer, R0, t0):
     q_crop_annotation = q_crop.copy()
+    
+    _r, _a, _ = gaussian_proxy.render_no_grad()
+    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
+        
     R, t = gaussian_proxy.get_T()
     R_np = t2np(R)
     t_np = t2np(t)
@@ -305,17 +306,17 @@ def make_comp_image(query, gaussian_proxy:GaussianRenderer, q_bbox, R0, t0):
     cv2.line(q_crop_annotation, o, tuple(imgpts[5]), (0, 255, 0), 1, cv2.LINE_AA)
     cv2.line(q_crop_annotation, o, tuple(imgpts[6]), (0, 0, 255), 1, cv2.LINE_AA)
     cv2.circle(q_crop_annotation, o, 6, (255, 255, 255), -1, cv2.LINE_AA)
-    draw_contour(q_crop_annotation, gray > 10)
-
+    
     gaussian_proxy.set_T(R0, t0)
-    _r, _, _ = gaussian_proxy.render()
-    gray = cv2.cvtColor(crop_with_bbox(render_to_image(_r[0]), q_bbox), cv2.COLOR_RGB2GRAY)
-    draw_contour(q_crop_annotation, gray > 10, (255, 0, 0))
+    _, _a0, _ = gaussian_proxy.render_no_grad()
+    draw_contour(q_crop_annotation, crop_with_bbox(t2np(_a0[0].squeeze(2)), q_bbox) > 0.5, (255, 0, 0))    
+    draw_contour(q_crop_annotation, crop_with_bbox(t2np(_a[0].squeeze(2)), q_bbox) > 0.5)
     
     q_w = q_crop.shape[1]
     alpha = 0.6
     overlay_crop = cv2.addWeighted(q_crop, alpha, r_crop, 1.0 - alpha, 0)
     res_img = np.zeros((q_crop.shape[0], q_crop.shape[1] * 4, 3), dtype=np.uint8)
+    draw_contour(q_crop, q_mask)
     res_img[:, :q_w] = q_crop
     res_img[:, q_w:q_w*2] = r_crop
     res_img[:, q_w*2:q_w*3] = overlay_crop
@@ -334,11 +335,10 @@ def make_pose_validation_image(query, gaussian_proxy:GaussianRenderer, q_bbox, d
 
     R, t = gaussian_proxy.get_T()
     
-    _r, _, _ = gaussian_proxy.render()
-    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
-    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
-    draw_contour(q_crop, gray > 10)
-    draw_contour(q_crop_t, gray > 10)    
+    _, _a, _ = gaussian_proxy.render_no_grad()    
+    mask_crop = crop_with_bbox(t2np(_a[0].squeeze(2)), q_bbox) > 0.5
+    draw_contour(q_crop, mask_crop)
+    draw_contour(q_crop_t, mask_crop)
 
     colors = [(217, 83, 25), (0, 114, 189), (77, 190, 238), (237, 177, 32), (119, 172, 38), (126, 47, 142)]
     dr = np.deg2rad(dra)    # 5 degree
@@ -349,40 +349,36 @@ def make_pose_validation_image(query, gaussian_proxy:GaussianRenderer, q_bbox, d
 
     Rx = torch.tensor([[1, 0, 0],[0, cos_r, -sin_r], [0, sin_r, cos_r]], device=R.device, dtype=torch.float32)
     gaussian_proxy.set_T(Rx @ R, t)
-    _r, _, _ = gaussian_proxy.render()
-    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
-    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
-    contours, _ = cv2.findContours( (gray > 10).astype(np.uint8) * 255, 
+    _, _a, _ = gaussian_proxy.render_no_grad()
+    mask_crop = crop_with_bbox(t2np(_a[0].squeeze(2)), q_bbox) > 0.5
+    contours, _ = cv2.findContours( mask_crop.astype(np.uint8) * 255, 
                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
     cv2.drawContours(q_crop, contours, -1, colors[0], 1)
     cv2.putText(q_crop, f"Rx {str_angle}", (12, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[0], 1)
     
     Ry = torch.tensor([[cos_r, 0, sin_r],[0, 1, 0], [-sin_r, 0, cos_r]], device=R.device, dtype=torch.float32)
     gaussian_proxy.set_T(Ry @ R, t)
-    _r, _, _ = gaussian_proxy.render()
-    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
-    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
-    contours, _ = cv2.findContours( (gray > 10).astype(np.uint8) * 255, 
+    _, _a, _ = gaussian_proxy.render_no_grad()
+    mask_crop = crop_with_bbox(t2np(_a[0].squeeze(2)), q_bbox) > 0.5
+    contours, _ = cv2.findContours( mask_crop.astype(np.uint8) * 255, 
                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
     cv2.drawContours(q_crop, contours, -1, colors[1], 1)
     cv2.putText(q_crop, f"Ry {str_angle}", (12, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[1], 1)
 
     Rz = torch.tensor([[cos_r, -sin_r, 0],[sin_r, cos_r, 0], [0, 0, 1]], device=R.device, dtype=torch.float32)
     gaussian_proxy.set_T(Rz @ R, t)
-    _r, _, _ = gaussian_proxy.render()
-    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
-    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
-    contours, _ = cv2.findContours( (gray > 10).astype(np.uint8) * 255, 
+    _, _a, _ = gaussian_proxy.render_no_grad()
+    mask_crop = crop_with_bbox(t2np(_a[0].squeeze(2)), q_bbox) > 0.5
+    contours, _ = cv2.findContours( mask_crop.astype(np.uint8) * 255, 
                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
     cv2.drawContours(q_crop, contours, -1, colors[2], 1)
     cv2.putText(q_crop, f"Rz {str_angle}", (12, 53), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[2], 1)
 
     t[0] += dt
     gaussian_proxy.set_T(R, t)
-    _r, _, _ = gaussian_proxy.render()
-    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
-    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
-    contours, _ = cv2.findContours( (gray > 10).astype(np.uint8) * 255, 
+    _, _a, _ = gaussian_proxy.render_no_grad()
+    mask_crop = crop_with_bbox(t2np(_a[0].squeeze(2)), q_bbox) > 0.5
+    contours, _ = cv2.findContours( mask_crop.astype(np.uint8) * 255, 
                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
     cv2.drawContours(q_crop_t, contours, -1, colors[3], 1)
     cv2.putText(q_crop_t, f"tx {str_t}", (12, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[3], 1)
@@ -390,10 +386,9 @@ def make_pose_validation_image(query, gaussian_proxy:GaussianRenderer, q_bbox, d
     t[0] -= dt
     t[1] += dt
     gaussian_proxy.set_T(R, t)
-    _r, _, _ = gaussian_proxy.render()
-    r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
-    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
-    contours, _ = cv2.findContours( (gray > 10).astype(np.uint8) * 255, 
+    _, _a, _ = gaussian_proxy.render_no_grad()
+    mask_crop = crop_with_bbox(t2np(_a[0].squeeze(2)), q_bbox) > 0.5
+    contours, _ = cv2.findContours( mask_crop.astype(np.uint8) * 255, 
                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
     cv2.drawContours(q_crop_t, contours, -1, colors[4], 1)
     cv2.putText(q_crop_t, f"ty {str_t}", (12, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[4], 1)
@@ -401,10 +396,10 @@ def make_pose_validation_image(query, gaussian_proxy:GaussianRenderer, q_bbox, d
     t[1] -= dt
     t[2] += dt
     gaussian_proxy.set_T(R, t)
-    _r, _, _ = gaussian_proxy.render()
+    _r, _a, _ = gaussian_proxy.render_no_grad()
     r_crop = crop_with_bbox(render_to_image(_r[0]), q_bbox)
-    gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
-    contours, _ = cv2.findContours( (gray > 10).astype(np.uint8) * 255, 
+    # gray = cv2.cvtColor(r_crop, cv2.COLOR_RGB2GRAY)
+    contours, _ = cv2.findContours( mask_crop.astype(np.uint8) * 255, 
                                     cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
     cv2.drawContours(q_crop_t, contours, -1, colors[5], 1)
     cv2.putText(q_crop_t, f"tz {str_t}", (12, 53), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[5], 1)
@@ -438,20 +433,51 @@ def retrieve_best(queryInfo, galleryInfo, extractor):
     # query bounding box can be larger than gallery bbox, so we use the max of both for square cropping
     q_bbox_size = max( g_bbox_size, q_bbox[2] - q_bbox[0], q_bbox[3] - q_bbox[1] )
     q_bbox_ext = square_bbox(q_bbox, q_bbox_size)
-    masked_query_crop = crop_with_bbox(queryInfo["masked_query"], q_bbox_ext)
+    masked_query_crop = crop_with_bbox(queryInfo["masked_query"], q_bbox_ext)    
+
+    # masked_query_crop = cv2.detailEnhance(masked_query_crop, sigma_s=10, sigma_r=0.15)     
 
     # A cropped query image for extracting DINOv2 feature
     ext_net = extractor[0]
     ext_opts = extractor[1]
     dino_size = ext_opts["input_size"]
     query_dino_in = square_pad_resize(masked_query_crop, dino_size * 2)
-    qfeat = ext_net.encode_4rgb(query_dino_in)
-    # qfeat = extractor.encode_rgb(query_dino_in)    
-    
+    if g_feats.shape[1] == 384:
+        qfeat = ext_net.encode_rgb(query_dino_in)    
+    elif g_feats.shape[1] == 384 * 4:
+        qfeat = ext_net.encode_4rgb(query_dino_in)
+        
     scores = (g_feats @ qfeat).numpy()
     best_item = np.argmax(scores)
     
     return best_item, scores[best_item], masked_query_crop, q_bbox_ext
+
+
+def retrieve_topk(queryInfo, galleryInfo, extractor, k=3):
+    # KSCHOI TODO: occlusion 상황에서 topk가 의미 있는지 확인 (현재는 DINO feature similarity top-1만 사용함)
+    g_feats = galleryInfo["feats"]
+    g_bbox_size = galleryInfo["bbox_size"]
+
+    q_bbox = queryInfo["bbox"]
+    # query bounding box can be larger than gallery bbox, so we use the max of both for square cropping
+    q_bbox_size = max( g_bbox_size, q_bbox[2] - q_bbox[0], q_bbox[3] - q_bbox[1] )
+    q_bbox_ext = square_bbox(q_bbox, q_bbox_size)
+    masked_query_crop = crop_with_bbox(queryInfo["masked_query"], q_bbox_ext)    
+
+    # A cropped query image for extracting DINOv2 feature
+    ext_net = extractor[0]
+    ext_opts = extractor[1]
+    dino_size = ext_opts["input_size"]
+    query_dino_in = square_pad_resize(masked_query_crop, dino_size * 2)
+    if g_feats.shape[1] == 384:
+        qfeat = ext_net.encode_rgb(query_dino_in)    
+    elif g_feats.shape[1] == 384 * 4:
+        qfeat = ext_net.encode_4rgb(query_dino_in)
+        
+    scores = (g_feats @ qfeat).numpy()    
+    topk_items = np.argsort(scores)[::-1][:k]    
+    
+    return topk_items, scores[topk_items], masked_query_crop, q_bbox_ext
 
 
 def compute_matches(query, gallery, matcher):
@@ -557,7 +583,115 @@ def get_T0(query_info, gallery_info, nets, K, reproj_thr):
     # reproj_stats_after_inliers = compute_mean_reprojection_error(
     #     pts0[inlier_idx], pts3d[inlier_idx], K, R0, t0
     # )
-    return R0, t0
+    return R0, t0, n_valid
+
+
+def get_T0_stereo(query_infos, gallery_info, nets, K, reproj_thr):
+    best_idx_l, score_l, query_crop_l, q_bbox_ext_l = retrieve_best(query_infos[0], gallery_info, nets[2])
+    best_idx_r, score_r, query_crop_r, q_bbox_ext_r = retrieve_best(query_infos[1], gallery_info, nets[2])
+    # prepare the best reference for matcher 
+    gallery_crop_l, g_bbox_ext_l = make_gallery_square(gallery_info, best_idx_l, query_crop_l.shape[0])
+    gallery_crop_r, g_bbox_ext_r = make_gallery_square(gallery_info, best_idx_r, query_crop_r.shape[0])
+
+    matching_results_l = compute_matches( query_crop_l, gallery_crop_l, nets[3] )
+    matching_results_r = compute_matches( query_crop_r, gallery_crop_r, nets[3] )
+
+    if len(matching_results_l[0]) > len(matching_results_r[0]):
+        matching_results = matching_results_l
+        q_bbox_ext = q_bbox_ext_l
+        g_bbox_ext = g_bbox_ext_l
+        query_info = query_infos[0]
+        best_idx = best_idx_l
+        which_query = 0
+    else:
+        matching_results = matching_results_r
+        q_bbox_ext = q_bbox_ext_r
+        g_bbox_ext = g_bbox_ext_r
+        query_info = query_infos[1]
+        best_idx = best_idx_r
+        which_query = 1
+
+    # matcher input size in the matcher options
+    pts0, pts1, conf = unmap_inlier_matches( matching_results, (q_bbox_ext, g_bbox_ext), query_info["mask"])
+    # match_img = draw_crop_matches(gallery_crop, query_crop, g_bbox_ext, q_bbox_ext, pts0, pts1, conf, None)
+
+    # Get initial pose using the matched 2D-3D correspondences and PnP
+    R_g, t_g = get_gallery_pose(gallery_info["poses"], best_idx)
+    g_bbox = gallery_info["bboxes"][best_idx]
+
+    xyz_dir = gallery_info["path"].parent / "xyz"
+    xyz_map = load_xyz_map(xyz_dir, best_idx)
+    pts2d_xyz = pts1 - [g_bbox[:2]]
+    
+    R0, t0, pts3d, reproj_err, inlier_idx, match_counts = get_initial_pose(
+        xyz_map, pts2d_xyz, pts0, conf, 
+        K, R_g, reproj_thr
+    )
+
+    n_valid = match_counts[-1][1]
+    assert n_valid == len(inlier_idx), "Length mismatch after get_initial_pose"
+    
+    # reproj_stats_after_inliers = compute_mean_reprojection_error(
+    #     pts0[inlier_idx], pts3d[inlier_idx], K, R0, t0
+    # )
+    return R0, t0, which_query
+
+
+def get_T0_stereo1(query_infos, gallery_info, nets, K, reproj_thr):
+    best_inds_l, score_l, query_crop_l, q_bbox_ext_l = retrieve_topk(query_infos[0], gallery_info, nets[2])
+    best_inds_r, score_r, query_crop_r, q_bbox_ext_r = retrieve_topk(query_infos[1], gallery_info, nets[2])
+    
+    # prepare the references for matcher
+    nMatches = 0 
+    for i in range(len(best_inds_l)):
+        gallery_crop_l, g_bbox_ext_l = make_gallery_square(gallery_info, best_inds_l[i], query_crop_l.shape[0])
+        matching_results_l = compute_matches( query_crop_l, gallery_crop_l, nets[3] )
+        if nMatches < len(matching_results_l[0]):
+            nMatches = len(matching_results_l[0])
+            matching_results = matching_results_l
+            gallery_crop, g_bbox_ext = gallery_crop_l, g_bbox_ext_l
+            best_idx = best_inds_l[i]
+            which_query = 0
+    
+    for i in range(len(best_inds_r)):
+        gallery_crop_r, g_bbox_ext_r = make_gallery_square(gallery_info, best_inds_r[i], query_crop_r.shape[0])
+        matching_results_r = compute_matches( query_crop_r, gallery_crop_r, nets[3] )
+        if nMatches < len(matching_results_r[0]):
+            nMatches = len(matching_results_r[0])
+            matching_results = matching_results_r
+            gallery_crop, g_bbox_ext = gallery_crop_r, g_bbox_ext_r
+            best_idx = best_inds_r[i]
+            which_query = 1
+
+    if which_query == 0:
+        q_bbox_ext = q_bbox_ext_l        
+    else:
+        q_bbox_ext = q_bbox_ext_r        
+
+    # matcher input size in the matcher options
+    pts0, pts1, conf = unmap_inlier_matches( matching_results, (q_bbox_ext, g_bbox_ext), query_infos[which_query]["mask"])
+    # match_img = draw_crop_matches(gallery_crop, query_crop, g_bbox_ext, q_bbox_ext, pts0, pts1, conf, None)
+
+    # Get initial pose using the matched 2D-3D correspondences and PnP
+    R_g, t_g = get_gallery_pose(gallery_info["poses"], best_idx)
+    g_bbox = gallery_info["bboxes"][best_idx]
+
+    xyz_dir = gallery_info["path"].parent / "xyz"
+    xyz_map = load_xyz_map(xyz_dir, best_idx)
+    pts2d_xyz = pts1 - [g_bbox[:2]]
+    
+    R0, t0, pts3d, reproj_err, inlier_idx, match_counts = get_initial_pose(
+        xyz_map, pts2d_xyz, pts0, conf, 
+        K, R_g, reproj_thr
+    )
+
+    n_valid = match_counts[-1][1]
+    assert n_valid == len(inlier_idx), "Length mismatch after get_initial_pose"
+    
+    # reproj_stats_after_inliers = compute_mean_reprojection_error(
+    #     pts0[inlier_idx], pts3d[inlier_idx], K, R0, t0
+    # )
+    return R0, t0, which_query
 
 
 def project_object_points(points_3d: torch.Tensor, R: torch.Tensor, t: torch.Tensor, K: torch.Tensor, bbox):
@@ -737,7 +871,7 @@ def refine_pose_stereo_GS(query_l_info, query_r_info,
     # query bounding box 
     bbox_l, bbox_r = adjust_stereo_bbox(query_l_info["bbox"], query_r_info["bbox"]) 
     query_l,  query_r  = {"bbox": bbox_l}, {"bbox": bbox_r}
-    render_l, render_r = {"bbox": bbox_l}, {"bbox": bbox_r}
+    render_l, render_r = {"bbox": bbox_l}, {"bbox": bbox_r}    
     
     # crop the mask and masked query image for the refinement step
     # c_ : cropped, m_ : masked
@@ -792,25 +926,25 @@ def refine_pose_stereo_GS(query_l_info, query_r_info,
 
         # full resolution render with identity cam (gsplat)
         gProxy.set_T(R_cur, t_cur)
-        _r, _, _ = gProxy.render()        
+        _r, _a, _ = gProxy.render()        
         render_l_f = _r[0].permute(2,0,1).clamp(0,1)
         render_l["crop"] = crop_chw_with_bbox(render_l_f, render_l["bbox"])
 
         gProxy.set_T(R_r_cur, t_r_cur)
-        _r_r, _, _ = gProxy.render()
+        _r_r, _a_r, _ = gProxy.render()
         render_r_f = _r_r[0].permute(2,0,1).clamp(0,1)
         render_r["crop"] = crop_chw_with_bbox(render_r_f, render_r["bbox"])
 
         loss_l = {}
         loss_r = {}
         # 1. Silhouette (Mask) Loss - render_crop:chw, query_mask: hw
-        render_l["c_mask"] = (render_l["crop"].sum(dim=0) > 0.05).float()
+        render_l["c_mask"] = crop_with_bbox((_a[0].squeeze() > 0.5).float(), render_l["bbox"])
         loss_l["mask"] = dice_loss(render_l["c_mask"], query_l["c_mask"])
         render_l["c_mask"] = erode_binary_tensor(render_l["c_mask"].unsqueeze(0), 3).squeeze(0)
         render_l["ci_mask"] = render_l["c_mask"] * query_l["c_mask"]
         render_l["mi_crop"] = render_l["crop"] * render_l["ci_mask"]        
         
-        render_r["c_mask"] = (render_r["crop"].sum(dim=0) > 0.05).float()
+        render_r["c_mask"] = crop_with_bbox((_a_r[0].squeeze() > 0.5).float(), render_r["bbox"])
         loss_r["mask"] = dice_loss(render_r["c_mask"], query_r["c_mask"])
         render_r["c_mask"] = erode_binary_tensor(render_r["c_mask"].unsqueeze(0), 3).squeeze(0)
         render_r["ci_mask"] = render_r["c_mask"] * query_r["c_mask"]
@@ -900,7 +1034,7 @@ def refine_pose_stereo_GS(query_l_info, query_r_info,
     best_R = best_state["R"].cpu().numpy().copy()
     best_t = best_state["t"].cpu().numpy().copy()
     
-    return best_R, best_t, best_state["loss"], query_l["bbox"], query_r["bbox"], losses
+    return best_R, best_t, best_state["loss"], (query_l, query_r), losses
 
 
 def refine_pose_rerender(query_info, gProxy:GaussianRenderer, options):
@@ -949,15 +1083,18 @@ def refine_pose_rerender(query_info, gProxy:GaussianRenderer, options):
     best_loss  = 1e9
     best_state = {"R": R0.detach(), "t": t0.detach(), "iter": 0}
 
-    with torch.no_grad():
-        render_chw, depth_hw = render_with_gsplat(
-            gaussians = gProxy.base,
-            R_obj_to_cam = R0, t_obj_to_cam = t0,
-            width = options["width"], height=options["height"],
-            fx=fx, fy=fy, cx=cx, cy=cy,
-            bg_color_str="0,0,0", device=device,
-            render_depth=True,
-        )        
+    _r, _a, _ = gProxy.render_no_grad("RGB+ED")
+    render_chw = _r[0][:3]
+    depth_hw = _r[0][3]
+    # with torch.no_grad():
+    #     render_chw, depth_hw = render_with_gsplat(
+    #         gaussians = gProxy.base,
+    #         R_obj_to_cam = R0, t_obj_to_cam = t0,
+    #         width = options["width"], height=options["height"],
+    #         fx=fx, fy=fy, cx=cx, cy=cy,
+    #         bg_color_str="0,0,0", device=device,
+    #         render_depth=True,
+    #     )        
     xyz_obj, _ = depth_tensor_to_xyz_map(depth_hw,
             fx = fx, fy = fy, cx = cx, cy = cy,
             R = R0, t = t0)
@@ -1100,7 +1237,7 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
         min_lr       = options["lr_rot"] * 0.01,
     )
 
-    _r, _, _ = gProxy.render_no_grad("RGB+ED")
+    _r, _a, _ = gProxy.render_no_grad("RGB+ED")
 
     # initial pose for left and right cam
     R0, t0 = gProxy.get_T()
@@ -1126,12 +1263,12 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
                                             fx = fx, fy = fy, cx = cx, cy = cy)
     
     render_l["crop0"] = crop_with_bbox(render_l_chw, render_l["bbox"])
-    render_l["c_mask"] = crop_with_bbox(depth_l_hw > FRUSTUM_N, render_l["bbox"])
+    render_l["c_mask"] = crop_with_bbox((_a[0].squeeze() > 0.5), render_l["bbox"])
     render_l["ci_mask"] = render_l["c_mask"] & query_l["c_mask"].bool()
     render_l["cif_mask"] = render_l["ci_mask"].float()
 
     render_r["crop0"] = crop_with_bbox(render_r_chw, render_r["bbox"])
-    render_r["c_mask"] = crop_with_bbox(depth_r_hw > FRUSTUM_N, render_r["bbox"])
+    render_r["c_mask"] = crop_with_bbox((_a[1].squeeze() > 0.5), render_r["bbox"])
     render_r["ci_mask"] = render_r["c_mask"] & query_r["c_mask"].bool()
     render_r["cif_mask"] = render_r["ci_mask"].float()
 
@@ -1180,7 +1317,7 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
         weight_blur = 1.0 * (1.0 - progress)        # 1.0에서 0.0으로 서서히 감소
         weight_l1   = 2.5
 
-        total_loss, loss_l, loss_r = calc_losses_rerender(
+        total_loss, loss_sub = calc_losses_rerender(
                 torch.stack((render_l["crop0"], render_r["crop0"])), 
                 torch.stack((query_l["rm_crop"], query_r["rm_crop"])),
                 [xyz_colors_l, xyz_colors_r], [sampled_colors_l, sampled_colors_r], 
@@ -1195,15 +1332,18 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
         optimizer.step()
         scheduler.step()
 
-        tracking_loss = loss_l["ecc"] + loss_r["ecc"] + loss_l["grad"] + loss_r["grad"] + loss_l["ssim"] + loss_r["ssim"] 
-        # tracking_loss = tracking_loss + (weight_l1 * (loss_l["rgb"]+loss_r["rgb"]))
-        tracking_loss = tracking_loss + (loss_l["blur"]+loss_r["blur"])
+        tracking_loss = loss_sub["ecc"] 
+        tracking_loss += loss_sub["ssim"]
+        tracking_loss += loss_sub["grad"]
+        tracking_loss += loss_sub["blur"]
+        # tracking_loss += (weight_l1 * loss_sub["rgb"])        
         loss_val = float(tracking_loss.item())
 
-        losses.append({"iter": it, "ecc_loss": (loss_l["ecc"] + loss_r["ecc"]).item(), 
-                       "grad_loss": (loss_l["grad"] + loss_r["grad"]).item(), 
-                       "blur_loss": (loss_l["blur"] + loss_r["blur"]).item(),                       
-                       "ssim_loss": (loss_l["ssim"] + loss_r["ssim"]).item(),
+        losses.append({"iter": it, 
+                       "ecc_loss": loss_sub["ecc"].item(), 
+                       "ssim_loss": loss_sub["ssim"].item(),
+                       "grad_loss": loss_sub["grad"].item(), 
+                       "blur_loss": loss_sub["blur"].item(),
                     #    "rgb_loss": (loss_l["rgb"]+loss_r["rgb"]).item(),
                        "loss": loss_val})
         
@@ -1233,7 +1373,7 @@ def refine_pose_stereo_rerender(query_l_info, query_r_info,
     best_R = best_state["R"].cpu().numpy().copy()
     best_t = best_state["t"].cpu().numpy().copy()
     
-    return best_R, best_t, best_state["loss"], query_l["bbox"], query_r["bbox"], losses
+    return best_R, best_t, best_state["loss"], (query_l, query_r), losses
 
 
 class SoftLBPLoss(nn.Module):
@@ -1422,7 +1562,7 @@ def solve_renders_PnP(renders: torch.Tensor, viewmats: torch.Tensor, query_crop:
         rvecs[iv] = cv2.Rodrigues(R1)[0].reshape(-1)
         tvecs[iv] = t1
 
-    return rvecs, tvecs
+    return rvecs, tvecs, len(conf)
 
 
 def refine_pose_stereo_PnP(query_l_info, query_r_info, 
@@ -1975,7 +2115,7 @@ def refine_pose_stereo_PnP_GS_rerender(query_l_info, query_r_info,
     return best_R, best_t, best_state["loss"], query_l["bbox"], query_r["bbox"], losses
 
 
-def refine_pose_stereo_PnP_GS_rerender1(query_l_info, query_r_info, 
+def refine_pose_stereo_PnP_GS_rerender1(query_l_info, query_r_info, which_query,
                                        gProxy:GaussianRenderer, options, R_lr, t_lr, matcher):
     assert gProxy.perturbation == False, "refine_pose_PnP requires gProxy.perturbation=False"
 
@@ -1989,6 +2129,8 @@ def refine_pose_stereo_PnP_GS_rerender1(query_l_info, query_r_info,
     # ndarray
     query_l["m_crop"] = crop_with_bbox(query_l_info["masked_query"], bbox_l)
     query_r["m_crop"] = crop_with_bbox(query_r_info["masked_query"], bbox_r)
+    # query_l["m_crop"] = cv2.detailEnhance(query_l["m_crop"], sigma_s=10, sigma_r=0.15) 
+    # query_r["m_crop"] = cv2.detailEnhance(query_r["m_crop"], sigma_s=10, sigma_r=0.15) 
     # tensor
     query_l["c_mask"] = np2t(crop_with_bbox(query_l_info["mask"], bbox_l)) / 255.0    
     query_r["c_mask"] = np2t(crop_with_bbox(query_r_info["mask"], bbox_r)) / 255.0
@@ -2008,18 +2150,21 @@ def refine_pose_stereo_PnP_GS_rerender1(query_l_info, query_r_info,
         viewmats = gProxy.viewmats
         _r, _, _ = gProxy.render_no_grad(render_mode="RGB+ED")
 
-        # left
-        # bboxes = (render_l["bbox"], query_l["bbox"])
-        # rvec_1, tvec_1 = solve_renders_PnP(_r[:1], viewmats[:1], query_l["m_crop"], bboxes, K, matcher)    
-        # right
-        bboxes = (render_r["bbox"], query_r["bbox"])
-        rvec_2, tvec_2 = solve_renders_PnP(_r[1:], viewmats[1:], query_r["m_crop"], bboxes, t2np(K), matcher)    
-
-        rvec_2 = cv2.Rodrigues(R_rl @ cv2.Rodrigues(rvec_2)[0])[0]
-        # rvec = (rvec_1 + rvec_2.T) / 2
-        # tvec = (tvec_1 + (R_rl @ t_rl + tvec_2)) / 2
-        rvec = rvec_2
-        tvec = R_rl @ t_rl + tvec_2
+        if which_query == 0:
+            # left
+            bboxes = (render_l["bbox"], query_l["bbox"])
+            rvec_1, tvec_1, n_p1 = solve_renders_PnP(_r[:1], viewmats[:1], query_l["m_crop"], bboxes, t2np(K), matcher)    
+            rvec = rvec_1
+            tvec = tvec_1
+        else:
+            # right
+            bboxes = (render_r["bbox"], query_r["bbox"])
+            rvec_2, tvec_2, n_p2 = solve_renders_PnP(_r[1:], viewmats[1:], query_r["m_crop"], bboxes, t2np(K), matcher)    
+            rvec_2 = cv2.Rodrigues(R_rl @ cv2.Rodrigues(rvec_2)[0])[0]
+            # rvec = (rvec_1 + rvec_2.T) / 2
+            # tvec = (tvec_1 + (R_rl @ t_rl + tvec_2)) / 2
+            rvec = rvec_2
+            tvec = R_rl @ t_rl + tvec_2
 
         R0, t0 = np2t(cv2.Rodrigues(rvec)[0]), np2t(tvec[0])
         gProxy.set_T( R0, t0 )
@@ -2242,7 +2387,7 @@ def refine_pose_stereo_PnP_GS_rerender1(query_l_info, query_r_info,
     best_R = best_state["R"].cpu().numpy().copy()
     best_t = best_state["t"].cpu().numpy().copy()
 
-    return best_R, best_t, best_state["loss"], query_l["bbox"], query_r["bbox"], losses
+    return best_R, best_t, best_state["loss"], (query_l, query_r), losses
 
 
 def estimate_object_pose(query, gallery_info, nets, gProxy:GaussianRenderer, K, pnp_option, render_options):
@@ -2260,7 +2405,7 @@ def estimate_object_pose(query, gallery_info, nets, gProxy:GaussianRenderer, K, 
     }
 
     # Best gallery selection - Feature matching - PnP
-    R0, t0 = get_T0(query_info, gallery_info, nets, K, pnp_option["reproj_thr"])
+    R0, t0, _ = get_T0(query_info, gallery_info, nets, K, pnp_option["reproj_thr"])
     t_step56 = sync_time()
 
     # Render & Compare
@@ -2280,15 +2425,20 @@ def estimate_object_pose(query, gallery_info, nets, gProxy:GaussianRenderer, K, 
 def estimate_object_pose_stereo(query, query_r, gallery_info, nets, 
                                 gProxy:GaussianRenderer, 
                                 K, R_lr, t_lr, pnp_option, render_options):
-    total_t0 = sync_time()
+    time_ = list()
+    
+
+    time_.append( sync_time() )
     query_bgr = cv2.cvtColor(query, cv2.COLOR_RGB2BGR)
     q_mask = detect_segment(query_bgr, nets[:2])
     q_bbox = compute_bbox(q_mask)  
+    q_mask = q_mask & ~get_specular_mask(query)
 
     query_r_bgr = cv2.cvtColor(query_r, cv2.COLOR_RGB2BGR)
     q_r_mask = detect_segment(query_r_bgr, nets[:2])
     q_r_bbox = compute_bbox(q_r_mask) 
-    t_step1 = sync_time()
+    q_r_mask = q_r_mask & ~get_specular_mask(query_r)
+    time_.append( sync_time() )
 
     query_info = {
         "rgb": query,    # full query image (RGB)
@@ -2305,37 +2455,35 @@ def estimate_object_pose_stereo(query, query_r, gallery_info, nets,
     }
 
     # Best gallery selection - Feature matching - PnP
-    R0, t0 = get_T0(query_info, gallery_info, nets, K, pnp_option["reproj_thr"])
-    t_step56 = sync_time()
+    R0, t0, which_query = get_T0_stereo([query_info, query_r_info], gallery_info, nets, K, pnp_option["reproj_thr"])
+    if which_query == 1:
+        R0 = t2np(R_lr.T) @ R0
+        t0 = (t0 - t2np(t_lr)) @ t2np(R_lr)
+
+    time_.append( sync_time() )
 
     METHOD = 'GS' 
     METHOD = 'RERENDER'
-    METHOD = 'MIXED' 
+    # METHOD = 'MIXED' 
     # Render & Compare
     gProxy.set_T(R0, t0)
     if METHOD == 'GS':
-        R, t, t_loss, bbox, bbox_r, losses = refine_pose_stereo_GS(query_info, query_r_info, 
-                                                                gProxy, render_options, R_lr, t_lr)
+        R, t, t_loss, queries, losses = refine_pose_stereo_GS(query_info, query_r_info, 
+                                                              gProxy, render_options, R_lr, t_lr)
     elif METHOD == 'RERENDER':
-        R, t, t_loss, bbox, bbox_r, losses = refine_pose_stereo_rerender(query_info, query_r_info, 
-                                                                        gProxy, render_options, R_lr, t_lr)
-    # R, t, bbox, bbox_r = refine_pose_stereo_PnP(query_info, query_r_info, 
-    #                                             gProxy, R_lr, t_lr, nets[3])
-    # R, t, t_loss, bbox, bbox_r, losses = refine_pose_stereo_PnP_GS(query_info, query_r_info, 
-    #                                             gProxy, render_options, R_lr, t_lr, nets[3])
+        R, t, t_loss, queries, losses = refine_pose_stereo_rerender(query_info, query_r_info, 
+                                                                         gProxy, render_options, R_lr, t_lr)    
     elif METHOD == 'MIXED':
-        R, t, t_loss, bbox, bbox_r, losses = refine_pose_stereo_PnP_GS_rerender1(query_info, query_r_info, 
+        R, t, t_loss, queries, losses = refine_pose_stereo_PnP_GS_rerender1(query_info, query_r_info, which_query,
                                                                                 gProxy, render_options, R_lr, t_lr, nets[3])
-    t_refine = sync_time()
+    time_.append( sync_time() )
 
     # Summary print
-    print(f"R: {R} \nt: {t*100}(cm)")
-    # print(f"tracking loss: {t_loss}")
-    print(f"Timing: detection+segmentation={t_step1 - total_t0:.3f}s, retrieval+matching+PnP={t_step56 - t_step1:.3f}s, refinement={t_refine - t_step56:.3f}s")
+    time_proc = np.diff(time_)
+    print(f"Timing: detection+segmentation={time_proc[0]:.3f}s, retrieval+matching+PnP={time_proc[1]:.3f}s, refinement={time_proc[2]:.3f}s")
     print(f"refinement update: Δr={cv2.Rodrigues(R)[0].T - cv2.Rodrigues(R0)[0].T}, Δt={(t - t0)*100}(cm)")
 
-    # return R, t, R0, t0, bbox, bbox_r, t_loss, losses
-    return R, t, R0, t0, bbox, bbox_r
+    return R, t, R0, t0, queries, losses, time_proc
 
 
 def main_object_pose_estimation():
@@ -2345,8 +2493,11 @@ def main_object_pose_estimation():
 
     # Setup
     config = load_json("ope_config.json")
-    model_dir = get_obj_path(config["object"], "model")
-    obj_out_dir = get_obj_path(config["object"], "output")
+    obj_num = config["object"]
+    obj_name = config["objects"][obj_num][0]
+    model_dir = get_obj_path(obj_name, "model")
+    obj_dir = get_obj_path(obj_name, "object")
+    obj_out_dir = get_obj_path(obj_name, "output")
     
     # Initialization
     # config["input"] = config["input_femto_bolt"]
@@ -2375,10 +2526,10 @@ def main_object_pose_estimation():
     nets = load_networks(config)
     
     render_options = config["renderer"]["options"]
-    gallery_info = construct_galleryInfo(obj_out_dir)
+    gallery_info = construct_galleryInfo(obj_dir)
 
     gaussian_proxy = GaussianRenderer( 
-        init_gaussians(config["renderer"], resolve_ply_path(model_dir), scale=0.955), 
+        init_gaussians(config["renderer"], resolve_ply_path(model_dir), scale=config["objects"][obj_num][1]), 
         K,
         np.array(config["renderer"]["options"]["background"], dtype=np.float32) / 255.0,
         render_options["width"], render_options["height"], False
@@ -2393,6 +2544,7 @@ def main_object_pose_estimation():
     # perform
     performance = []
     pose_results = []
+    time_refine = []
 
     if USE_STEREO:
         assert len(query_paths) % 2 == 0, "For stereo image pairs, the number of query images should be even (left-right pairs)."
@@ -2402,14 +2554,15 @@ def main_object_pose_estimation():
     
     # idx = range(len(query_paths))
     for i in idx:
-        if i == 24:
-            break
+        # if i == 24:
+        #     break
         query = load_rgb(query_paths[i])
         assert render_options["width"] == query.shape[1] and render_options["height"] == query.shape[0]
 
         if USE_STEREO:
             query_r = load_rgb(query_paths[i+1])
 
+        print("Query file:", query_paths[i])
         # time measurement
         st = time.perf_counter()
         
@@ -2418,7 +2571,10 @@ def main_object_pose_estimation():
                 query, query_r, 
                 gallery_info, nets, gaussian_proxy, K, R_lr, t_lr, 
                 pnp_option, render_options)
-            R, t, R0, t0, q_bbox, q_bbox_r = res # , t_loss, losses
+            R, t, R0, t0, queries, losses, time_proc = res # , t_loss, losses
+            q_bbox = queries[0]["bbox"]
+            q_bbox_r = queries[1]["bbox"]
+            time_refine.append(time_proc[-1])
         else:
             res = estimate_object_pose(
                 query, 
@@ -2442,7 +2598,7 @@ def main_object_pose_estimation():
         # Visualization
         fnstem = query_paths[i].stem
         gaussian_proxy.set_T(R, t)
-        comp_img = make_comp_image(query, gaussian_proxy, q_bbox, R0, t0)
+        comp_img = make_comp_image(crop_with_bbox(query, q_bbox), t2np(queries[0]["c_mask"]*255.0).astype(np.uint8), q_bbox, gaussian_proxy, R0, t0)
         vis_path = obj_out_dir / "result" / f"{fnstem}_comp.png"
         vis_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(vis_path), cv2.cvtColor(comp_img, cv2.COLOR_RGB2BGR))
@@ -2452,6 +2608,8 @@ def main_object_pose_estimation():
         vis_path = obj_out_dir / "result" / f"{fnstem}_pose_valid.png"
         cv2.imwrite(str(vis_path), cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
 
+        # np.save( obj_out_dir / "result" / f"{fnstem[:-1]}.npy", losses )
+
         if USE_STEREO:
             R_r = R_lr.detach().cpu().numpy() @ R
             t_r = t @ R_lr.T.detach().cpu().numpy() + t_lr.detach().cpu().numpy() 
@@ -2460,7 +2618,7 @@ def main_object_pose_estimation():
             t_r0 = t0 @ R_lr.T.detach().cpu().numpy() + t_lr.detach().cpu().numpy() 
 
             gaussian_proxy.set_T(R_r, t_r)
-            comp_img = make_comp_image(query_r, gaussian_proxy, q_bbox_r, R_r0, t_r0)
+            comp_img = make_comp_image(crop_with_bbox(query_r, q_bbox_r), t2np(queries[1]["c_mask"]*255.0).astype(np.uint8), q_bbox_r, gaussian_proxy, R_r0, t_r0)
             vis_path = obj_out_dir / "result" / f"{fnstem[:-1]}R_comp.png"
             vis_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(vis_path), cv2.cvtColor(comp_img, cv2.COLOR_RGB2BGR))
@@ -2480,8 +2638,8 @@ def main_object_pose_estimation():
     
     
     print("\n=== Performance Summary ===")
-    print(f"pose estimation time: {np.mean([p[0] for p in performance]):.6f} seconds")
-    print(f"tracking loss: {np.mean([p[1] for p in performance]):.6f}")
+    print(f"pose refinement estimation time: {np.mean(time_refine[1:]) * 1000:.1f} ms\n\n")
+    # print(f"tracking loss: {np.mean([p[1] for p in performance]):.6f}")
 
 
 if __name__ == "__main__":
