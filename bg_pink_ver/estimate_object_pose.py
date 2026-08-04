@@ -506,7 +506,7 @@ def unmap_inlier_matches(matching_results, bboxes, mask, match_in_size):
     return pts0_full, pts1_full, conf
 
 
-from utils.image_utils import draw_crop_matches, draw_matches
+from utils.image_utils import draw_matches_FHD, draw_matches
 def get_T0(query_info, gallery_info, nets, K, reproj_thr):
     best_idx, score, query_crop, q_bbox_ext = retrieve_best(query_info, gallery_info, nets[2])
     # prepare the best reference for matcher 
@@ -517,7 +517,7 @@ def get_T0(query_info, gallery_info, nets, K, reproj_thr):
     match_in_size = nets[3]["options"]["input_size"]
     pts0, pts1, conf = unmap_inlier_matches( matching_results, (q_bbox_ext, g_bbox_ext), query_info["mask"], match_in_size)
 
-    # match_img = draw_crop_matches(gallery_crop, query_crop, g_bbox_ext, q_bbox_ext, pts0, pts1, conf, None)
+    # match_img = draw_matches_FHD(gallery_crop, query_crop, g_bbox_ext, q_bbox_ext, pts0, pts1, conf, None)
 
     # Get initial pose using the matched 2D-3D correspondences and PnP
     R_g, t_g = get_gallery_pose(gallery_info["poses"], best_idx)

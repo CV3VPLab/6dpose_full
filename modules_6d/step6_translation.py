@@ -1310,12 +1310,10 @@ def get_initial_pose(xyz_map, pts_2d_xyz, pts_2d_query, conf, K, R0, reproj_thre
     # Rendered gallery의 XYZ map에서 pts_g_full의 픽셀 위치에 해당하는 3D 좌표를 가져옴
     pts3d, valid_mask = lookup_xyz(xyz_map, pts_2d_xyz)
     n_valid = int(valid_mask.sum())
+    
     print(f"  Valid 2D-3D correspondences: {n_valid} / {len(pts_2d_xyz)}")
     if n_valid < 4:
-        raise RuntimeError(
-            f"Not enough valid 2D-3D correspondences ({n_valid}). "
-            "XYZ map이 비어있거나 gallery_xyz_dir 경로를 확인하세요."
-        )
+        raise RuntimeError(f"Not enough valid 2D-3D correspondences ({n_valid}). ")
     match_counts.append( ("valid (not NaN nor near cam) xyz(3D) points", n_valid) )
 
     pts3d = pts3d[valid_mask]
@@ -1337,36 +1335,7 @@ def get_initial_pose(xyz_map, pts_2d_xyz, pts_2d_query, conf, K, R0, reproj_thre
     match_counts.append( ("inlier (not too far) 3D points", n_valid) )
     
     if n_valid < 4:
-        raise RuntimeError(
-            f"Not enough correspondences after 3D outlier filtering: {n_valid}"
-        )
-
-    use_uniform_sampling = False #  True
-    if use_uniform_sampling:
-        keep_idx, uniform_cell_stats = uniform_sample_points_2d(
-            pts2d,
-            scores=conf,
-            grid_rows=10,
-            grid_cols=10,
-            max_per_cell=60,
-        )
-
-        print(f"  Uniform sampling: {len(keep_idx)} / {n_valid} kept")
-        print(f"  Uniform cell stats: {uniform_cell_stats}")
-
-        pts2d = pts2d[keep_idx]
-        pts3d = pts3d[keep_idx]
-        conf  = conf[keep_idx]
-        inlier_idx = inlier_idx[keep_idx]
-        n_valid = len(inlier_idx)
-        match_counts.append( ("uniformly sampled points", n_valid) )
-
-        if n_valid < 4:
-            raise RuntimeError(
-                f"Not enough correspondences after uniform sampling: {n_valid}"
-            )
-    else:
-        print("  Uniform sampling disabled")
+        raise RuntimeError(f"Not enough correspondences after 3D outlier filtering: {n_valid}")
 
     R, t, reproj_err, pnp_inlier_idx = solve_pose_pnp(
         pts2d, pts3d,
@@ -1376,7 +1345,7 @@ def get_initial_pose(xyz_map, pts_2d_xyz, pts_2d_query, conf, K, R0, reproj_thre
 
     match_counts.append( ("inliers after PnP reprojection error filtering", len(pnp_inlier_idx)) )
 
-    return R, t, pts3d, reproj_err, inlier_idx[pnp_inlier_idx], match_counts
+    return R, t, pts3d[pnp_inlier_idx], reproj_err, inlier_idx[pnp_inlier_idx], match_counts
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry

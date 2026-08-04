@@ -320,7 +320,7 @@ def scale_image_draw_maskcontour(img: np.ndarray, scale, mask: np.ndarray, color
     return resimg
 
 
-def draw_crop_matches(gcrop, qcrop, gbbox, qbbox, pts0, pts1, conf, out_path):
+def draw_matches_FHD(gcrop, qcrop, gbbox, qbbox, pts0, pts1, conf, out_path):
     gimg = np.zeros((1080, 1920, 3), dtype=np.uint8)
     qimg = np.zeros((1080, 1920, 3), dtype=np.uint8)
     gimg[gbbox[1]:gbbox[3], gbbox[0]:gbbox[2]] = gcrop

@@ -150,16 +150,6 @@ def depth_sample_to_xyz(depth: np.ndarray, pts2d: np.ndarray,
     return xyz_obj
 
 
-"""
-[가정 - gsplat 기본 convention]
-  - viewmat (w2c): world-to-camera, OpenCV convention (x:right, y:down, z:forward)
-  - depth: camera space의 z-depth. render_mode="RGB+ED"의 expected depth 사용.
-           (render_mode="D"의 누적 depth라면 alpha로 나눠 정규화한 뒤 넣을 것)
-  - K = [[fx, 0, cx],
-         [0, fy, cy],
-         [0,  0,  1]]
-"""
-
 # ---------------------------------------------------------------------------
 # 0. Depth unprojection : depth map(+mask) -> world space point cloud
 # ---------------------------------------------------------------------------
@@ -197,6 +187,34 @@ def unproject(depth, K, c2w, mask, rgb, depth_max=None):
         rgb = rgb / 255.0
     cols = rgb[valid]
     return pts_world, cols
+
+
+def triangulate_stereo(pts_l, pts_r, Q):
+    assert pts_l.shape[1] == 2 and pts_r.shape[1] == 2
+
+    valid_idx = np.abs(pts_l[:, 1] - pts_r[:, 1]) < 1
+    pts_l = pts_l[valid_idx]
+    pts_r = pts_r[valid_idx]
+    d = pts_l[:,0] - pts_r[:,0]
+    p = np.hstack((pts_l, d[:, np.newaxis], np.ones((len(d),1))))
+    p3 = p @ Q.T
+    p3 = p3[:, :3] / p3[:, 3:4]
+    return p3, valid_idx
+
+
+def find_nearest_numpy(A, B):
+    # A: [n, 3], B: [m, 3] 배열 또는 2차원 배열
+    # 브로드캐스팅을 위해 차원 확장: B[:, None, :] - A[None, :, :]
+    diff = B[:, np.newaxis, :] - A[np.newaxis, :, :]
+    
+    # 유클리디안 거리 계산
+    dist_matrix = np.linalg.norm(diff, axis=-1)
+    
+    # 최소 거리 인덱스 찾기
+    nearest_indices = np.argmin(dist_matrix, axis=1)
+    min_dist = dist_matrix[np.arange(len(B)), nearest_indices]
+    
+    return min_dist, nearest_indices
 
 
 def is_valid_point3d(pts3d: np.ndarray):

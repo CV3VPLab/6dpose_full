@@ -9,8 +9,8 @@ def load_yolo_model(weights_path: str):
     return YOLO(weights_path)
 
 
-def detect_with_yolo(model, image_bgr, conf_thres=0.25):
-    results = model.predict(source=image_bgr, conf=conf_thres, verbose=False)
+def detect_with_yolo(model, image_bgr, conf_thres=0.25, imgsz=1280):
+    results = model.predict(source=image_bgr, conf=conf_thres, imgsz=imgsz, verbose=False)
     if len(results) == 0:
         return None
     boxes = results[0].boxes

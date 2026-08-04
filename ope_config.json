@@ -11,15 +11,19 @@
         "cam_type": "zed_m",
         "K_filename": "calibration.json"
     },
-    "objects": [["can_mtdew", 0.995], ["can_fanta", 0.995], ["drill_yellow", 1.012], ["usb_4", 1.0]]
+    "objects": [["can_mtdew",    0.995, "specular"], 
+                ["can_fanta",    0.995, "specular"], 
+                ["drill_yellow", 1.012, "normal"], 
+                ["usb_4",        1.000, "normal"]]
     ,
     "object": 0
     ,
     "detector": {
         "name": "yolo",
-        "weights": "weights/best.pt",
+        "weights": "weights/best_1280_0801.pt",
         "options": {
-            "conf_thr": 0.25
+            "conf_thr": 0.25,
+            "imgsz": 1280
         }
     },
     "segmentator": {
