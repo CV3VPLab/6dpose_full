@@ -1,23 +1,34 @@
 import argparse
+import warnings
 import json
+import joblib  
+import matplotlib.pyplot as plt
+
 from pathlib import Path
+from tqdm.rich import tqdm
+from tqdm import TqdmExperimentalWarning
+
 
 import numpy as np
 import torch
-from tqdm import tqdm
 import cv2
-import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
 
-from gaussian_renderer import GaussianModel
-from refine_pose import GaussianRenderer
+from gaussian_renderer    import GaussianModel
+from refine_pose          import GaussianRenderer
+from estimate_object_pose import init_gaussians
 
-from modules_6d.retrieval_dino import DinoV2Extractor
+from modules_6d.retrieval_dino import load_extractor, preprocess_for_dinov2
+
+from utils.general_utils import sync_time
 
 from utils.io_utils import (
     ensure_dir, 
     resolve_ply_path,
     load_json,
-    load_intrinsics, K_to_params
+    load_intrinsics, K_to_params, params_to_K,
+    get_obj_path, get_K_path,
+    get_named_config
 )
 from utils.image_utils import (
     compute_bbox,
@@ -32,88 +43,19 @@ from utils.image_utils import tensor_to_np as t2np
 
 from utils.geom_utils import depth_to_xyz_map
 
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Render gallery images from custom poses for GS model")
-    p.add_argument("--obj_dir", required=True, type=str)    
-    p.add_argument("--gallery_pose_json", required=True, type=str,
-                   help="Path to gallery_poses.json")
-    p.add_argument("--intrinsics_path", required=True, type=str,
-                   help="Path to intrinsics txt file")
-    p.add_argument("--width", required=True, type=int)
-    p.add_argument("--height", required=True, type=int)
-    p.add_argument("--background", default="0,0,0", type=str,
-                   help="R,G,B in 0-255")
-    p.add_argument("--sh_degree", default=3, type=int)
-    p.add_argument("--convert_SHs_python", action="store_true")
-    p.add_argument("--compute_cov3D_python", action="store_true")
-    p.add_argument("--debug", action="store_true")
-    p.add_argument("--antialiasing", action="store_true")
-    p.add_argument("--gs_mode", default="3dgs", choices=["3dgs", "2dgs"])
-    p.add_argument("--save_depth", action="store_true")
-    p.add_argument("--save_xyz", action="store_true")
-    p.add_argument("--dino_model", type=str, default="dinov2_vits14")
-    p.add_argument("--dino_input_size", type=int, default=224)
-    return p.parse_args()
+warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
 
-def load_gallery_poses(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def project_obj_to_image(X_obj, fx, fy, cx, cy, R_obj_to_cam, t_obj_to_cam):
-    X_obj = np.asarray(X_obj, dtype=np.float32).reshape(3, 1)
-    R = np.asarray(R_obj_to_cam, dtype=np.float32)
-    t = np.asarray(t_obj_to_cam, dtype=np.float32).reshape(3, 1)
-
-    X_cam = R @ X_obj + t
-    xc, yc, zc = X_cam.reshape(3)
-
-    if zc <= 1e-8:
-        return None
-
-    u = fx * xc / zc + cx
-    v = fy * yc / zc + cy
-    return np.array([u, v], dtype=np.float32)
-
-
-def save_xyz_reprojection_check(render_bgr, xyz_obj, fx, fy, cx, cy, R, t, out_path, stride=200):
-    vis = render_bgr.copy()
-    H, W = xyz_obj.shape[:2]
-
-    for y in range(0, H, stride):
-        for x in range(0, W, stride):
-            X_obj = xyz_obj[y, x]
-            if not np.isfinite(X_obj).all():
-                continue
-            if np.linalg.norm(X_obj) < 1e-8:
-                continue
-
-            uv = project_obj_to_image(X_obj, fx, fy, cx, cy, R, t)
-            if uv is None:
-                continue
-
-            u2, v2 = int(round(uv[0])), int(round(uv[1]))
-
-            cv2.circle(vis, (x, y), 2, (0, 255, 255), -1, cv2.LINE_AA)
-
-            if 0 <= u2 < W and 0 <= v2 < H:
-                cv2.circle(vis, (u2, v2), 2, (0, 0, 255), -1, cv2.LINE_AA)
-                cv2.line(vis, (x, y), (u2, v2), (255, 0, 0), 1, cv2.LINE_AA)
-
-    cv2.imwrite(str(out_path), vis)
-
-
-def render_save(pose_info, gaussianRenderer: GaussianRenderer, K, args):
-    obj_dir = Path(args.obj_dir)    # 3DGS path
-    render_dir = obj_dir / "gallery" # rendered gallery path            
-    if args.save_depth:
-        depth_dir = obj_dir / "depth"            
-    if args.save_xyz:
-        xyz_dir = obj_dir / "xyz"
+def render_save(pose_info, gaussianRenderer: GaussianRenderer, K, obj_name, bsave_depth=False):
+    obj_dir    = get_obj_path(obj_name, "object")        
+    render_dir = get_obj_path(obj_name, "gallery") 
+    xyz_dir    = get_obj_path(obj_name, "xyz")
+    
+    if bsave_depth:
+        depth_dir = get_obj_path(obj_name, "depth")
 
     idx = pose_info["index"]        
+    assert idx < 10000 # max file number : 9999
 
     R = np.array(pose_info["R_obj_to_cam"], dtype=np.float32)
     t = np.array(pose_info["t_obj_to_cam"], dtype=np.float32)
@@ -131,33 +73,28 @@ def render_save(pose_info, gaussianRenderer: GaussianRenderer, K, args):
     rgb_crop = ((rgb_crop * mask_crop[..., np.newaxis]) * 255.0).astype(np.uint8)
     cv2.imwrite(str(render_dir / f"{idx:04d}.png"), cv2.cvtColor(rgb_crop, cv2.COLOR_RGB2BGR))            
 
-    # 32-bit float depth map in camera coordinates (same unit as canonical Gaussian means, typically meters). Invalid pixels have value 0.
-    depth_np = None
-    if args.save_depth:
-        depth_np = t2np(_r[0][..., 3]) * mask
-        assert depth_np.dtype == np.float32, f"Expected depth tensor to be float32, got {depth_np.dtype}"
+    # XYZ map, optionally depth map
+    depth_np = t2np(_r[0][..., 3]) * mask
 
+    xyz_obj = depth_to_xyz_map(
+        depth_np=depth_np,
+        fx=K[0,0], fy=K[1,1], cx=K[0,2], cy=K[1,2],
+        R_obj_to_cam=pose_info["R_obj_to_cam"],
+        t_obj_to_cam=pose_info["t_obj_to_cam"]
+    )
+    xyz_obj_crop = crop_with_bbox(xyz_obj, g_crop_bbox)            
+    np.save(str(xyz_dir / f"{idx:04d}.npy"), xyz_obj_crop)
+
+    if bsave_depth:
         # save cropped depth data
         depth_crop = crop_with_bbox(depth_np, g_crop_bbox)
         fn_crop = depth_dir / f"{idx:04d}.npy"
-        np.save(str(fn_crop), depth_crop)    
-
-    if args.save_xyz:
-        if depth_np is None:
-            depth_np = t2np(_r[0][..., 3]) * mask
-
-        xyz_obj = depth_to_xyz_map(
-            depth_np=depth_np,
-            fx=K[0,0], fy=K[1,1], cx=K[0,2], cy=K[1,2],
-            R_obj_to_cam=pose_info["R_obj_to_cam"],
-            t_obj_to_cam=pose_info["t_obj_to_cam"]
-        )
-        xyz_obj_crop = crop_with_bbox(xyz_obj, g_crop_bbox)            
-        np.save(str(xyz_dir / f"{idx:04d}.npy"), xyz_obj_crop)
+        np.save(str(fn_crop), depth_crop)
         
-    return g_crop_bbox
+    return g_crop_bbox, mask_crop
 
-def run_render_gallery(args, gaussians=None):
+
+def run_render_gallery(config):
     """
     Run gallery rendering.
     Pass pre-loaded gaussians to skip model loading (for in-process preloading).
@@ -166,24 +103,32 @@ def run_render_gallery(args, gaussians=None):
     if device != "cuda":
         raise RuntimeError("This renderer is expected to run on CUDA.")
 
-    obj_dir = Path(args.obj_dir)    # 3DGS path
-    model_dir = obj_dir / "model"
-    render_dir = obj_dir / "gallery" # rendered gallery path
+    obj_config = get_named_config(config["objects"])
+    obj_name   = obj_config["name"]
+    obj_params = obj_config["params"]
+    
+    # folder check
+    obj_dir    = get_obj_path(obj_name, "object")    
+    model_dir  = get_obj_path(obj_name, "model")
+    render_dir = get_obj_path(obj_name, "gallery") 
+    xyz_dir    = get_obj_path(obj_name, "xyz")
+
     ensure_dir(obj_dir)
     ensure_dir(model_dir)
     ensure_dir(render_dir)
+    ensure_dir(xyz_dir)
         
-    if args.save_depth:
-        depth_dir = obj_dir / "depth"
+    bsave_depth = config["gallery"]["save_depth"]
+    if bsave_depth == True:        
+        depth_dir = get_obj_path(obj_name, "depth")
         ensure_dir(depth_dir)
-    
-    if args.save_xyz:
-        xyz_dir = obj_dir / "xyz"
-        ensure_dir(xyz_dir)
 
-    galleryPoses = load_gallery_poses(args.gallery_pose_json)["poses"]
+    # gallery pose loading
+    gallery_pose_path = obj_dir.parent.parent / "gallery_poses.json"
+    galleryPoses = load_json(gallery_pose_path)["poses"]
+
     # fx, fy, cx, cy = K_to_params(load_intrinsics(args.intrinsics_path))
-    calib_info = load_json(args.intrinsics_path)
+    calib_info = load_json(get_K_path(config["inputs"][config["input"]]))
     fx = calib_info["left_rect"]["fx"]
     fy = calib_info["left_rect"]["fy"]
     cx = calib_info["left_rect"]["cx"]
@@ -191,28 +136,24 @@ def run_render_gallery(args, gaussians=None):
 
     ply_path = resolve_ply_path(model_dir)
 
+    img_width = config["renderer"]["options"]["width"]
+    img_height = config["renderer"]["options"]["height"]
+
     print("=" * 60)
     print("[render_gallery.py] GS gallery render")
     print(f"  model_dir   : {model_dir}")
     print(f"  ply_path    : {ply_path}")
-    print(f"  width/height: {args.width} x {args.height}")
+    print(f"  width/height: {img_width} x {img_height}")
     print(f"  fx, fy      : {fx:.4f}, {fy:.4f}")
     print(f"  cx, cy      : {cx:.4f}, {cy:.4f}")
     print("=" * 60)
 
-    if gaussians is None:
-        gaussians = GaussianModel(args.sh_degree)
-        gaussians.load_ply(str(ply_path), scale=1.0, use_train_test_exp=False)
-        gaussians.freeze_except_pose()
-
-        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-        gaussianR = GaussianRenderer(
-            gaussians, K,
-            np.array([0,0,0], dtype=np.float32) / 255.0,
-            args.width, args.height, False
-        )
-    else:
-        print("[render_gallery.py] Using pre-loaded GaussianModel (skipping PLY load)")
+    K = params_to_K(fx, fy, cx, cy)
+    gaussianR = GaussianRenderer(
+        init_gaussians(config["renderer"], ply_path, scale=1.0), 
+        K, np.array([0,0,0], dtype=np.float32) / 255.0,
+        img_width, img_height, False
+    )    
 
     gallery_bboxes = []
 
@@ -224,29 +165,32 @@ def run_render_gallery(args, gaussians=None):
         nPoses += 1
 
     # Render each gallery pose with GSplat and save results
-    print("GS gallery rendering - Cropped rendered image, depth map, XYZ map")
+    print(f"GS gallery rendering - Cropped rendered image, XYZ map{', depth map' if bsave_depth else ''}")
     gallery_bboxes = np.zeros((nPoses, 4), dtype=np.int32)
+    masks = []
     for i, pose in enumerate(tqdm(galleryPoses, desc="GS gallery rendering")):
-        g_crop_bbox = render_save(pose, gaussianR, K, args)
-        gallery_bboxes[i] = g_crop_bbox        
+        g_crop_bbox, mask_crop = render_save(pose, gaussianR, K, obj_name, bsave_depth)
+        gallery_bboxes[i] = g_crop_bbox 
+        masks.append(mask_crop)       
 
     # save bounding boxes of gallery for later reference
     np.save(obj_dir / "g_bboxes.npy", gallery_bboxes)
 
-    return gallery_bboxes
+    return gallery_bboxes, masks
 
 
-def extract_dino_features(args, gallery_bboxes):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device != "cuda":
+def extract_dino_features(gallery_bboxes, extractor_config, obj_dir):
+    if not torch.cuda.is_available():
         raise RuntimeError("This renderer is expected to run on CUDA.")
-    
+    device = "cuda"
+
     bbox_size = get_max_bbox_size(gallery_bboxes)
     
-    extractor = DinoV2Extractor(args.dino_model, device=device) 
-    dino_in_size = args.dino_input_size
+    extractor, ext_options = load_extractor(extractor_config)
 
-    cache_dir = Path(args.obj_dir)
+    dino_in_size = ext_options["input_size"]
+
+    cache_dir = obj_dir
     print(f"  DINOv2 cache dir: {cache_dir}")
 
     n_horz_patches = 1 if bbox_size < dino_in_size else 2
@@ -254,7 +198,7 @@ def extract_dino_features(args, gallery_bboxes):
 
     features = torch.zeros( size=[len(gallery_bboxes), dino_out_size], dtype=torch.float32 )  
 
-    render_dir = Path(args.obj_dir) / "gallery"    
+    render_dir = Path(obj_dir) / "gallery"    
     for idx in tqdm(range(len(gallery_bboxes)), desc=f"DINO feature extraction (feat. dim: {dino_out_size})"):
         img_rgb_crop = load_rgb(render_dir / f"{idx:04d}.png")
         assert gallery_bboxes[idx][2] - gallery_bboxes[idx][0] == img_rgb_crop.shape[1] and gallery_bboxes[idx][3] - gallery_bboxes[idx][1] == img_rgb_crop.shape[0], f"Crop size mismatch: expected ({gallery_bboxes[idx][2] - gallery_bboxes[idx][0]}, {gallery_bboxes[idx][3] - gallery_bboxes[idx][1]}), got {img_rgb_crop.shape[1]}, {img_rgb_crop.shape[0]}"
@@ -268,29 +212,111 @@ def extract_dino_features(args, gallery_bboxes):
             feat = extractor.encode_4rgb(gallery_crop_dino)
         assert feat.shape == (dino_out_size,), f"Unexpected DINO feature shape: {feat.shape}"
 
-        features[idx] = feat
-        # feat = feat.numpy()
-        # cache_feat_path = cache_dir / f"{idx:04d}_{args.dino_model.replace('/', '_')}.npy"
-        # np.save(str(cache_feat_path), feat)
+        features[idx] = feat.cpu()        
 
-    features_np = features.numpy()
-    np.save( str(cache_dir / f"g_features.npy"), features_np)
+    feature_data = [extractor_config["name"], features.numpy()]
+    np.savez_compressed( str(cache_dir / f"g_features.npz"), *feature_data)
 
-    print(f"Saved DINO features {features_np.shape}")
+    print(f"Saved DINO features {feature_data[1].shape}")
     
-    return features # (3024, 384 * n_horz_patches ^ 2) CPU tensor
+    return feature_data # (3024, 384 * n_horz_patches ^ 2) CPU tensor
 
 
-def main():
-    args = parse_args()
-    gallery_bboxes = run_render_gallery(args)
-    # gallery_bboxes = np.load(Path(args.obj_dir) / "g_bboxes.npy")
+def extract_dino_masking_features(gallery_bboxes, masks, extractor_config, obj_dir):
+    if not torch.cuda.is_available():
+        raise RuntimeError("This renderer is expected to run on CUDA.")
+    device = "cuda"
+    
+    bbox_size = get_max_bbox_size(gallery_bboxes)
+    
+    extractor, ext_options = load_extractor(extractor_config)
+    dino_in_size = ext_options["input_size"]
 
-    extract_dino_features(args, gallery_bboxes)
+    cache_dir = obj_dir
+    print(f"  DINOv2 cache dir: {cache_dir}")
+
+    n_horz_patches = 1 if bbox_size < dino_in_size else 2    
+
+    features = []
+
+    for idx in tqdm(range(len(gallery_bboxes)), desc="DINO masked feature extraction"):
+        img_rgb_crop = load_rgb( obj_dir / "gallery" / f"{idx:04d}.png")
+        assert gallery_bboxes[idx][2] - gallery_bboxes[idx][0] == img_rgb_crop.shape[1] and gallery_bboxes[idx][3] - gallery_bboxes[idx][1] == img_rgb_crop.shape[0], f"Crop size mismatch: expected ({gallery_bboxes[idx][2] - gallery_bboxes[idx][0]}, {gallery_bboxes[idx][3] - gallery_bboxes[idx][1]}), got {img_rgb_crop.shape[1]}, {img_rgb_crop.shape[0]}"
+        assert img_rgb_crop.shape[:2] == masks[idx].shape, f"Mask shape mismatch: expected {img_rgb_crop.shape[:2]}, got {masks[idx].shape}"
+        
+        gallery_crop, _ = zeropad_square(img_rgb_crop, bbox_size)        
+        gmask_crop,   _ = zeropad_square(masks[idx],   bbox_size)
+        
+        gallery_crop_dino = square_pad_resize(gallery_crop, dino_in_size * n_horz_patches)  
+        gmask_crop_dino   = square_pad_resize(gmask_crop,   dino_in_size * n_horz_patches)  
+        gal_t, gmsk_t = preprocess_for_dinov2(gallery_crop_dino, gmask_crop_dino)  # Preprocess the image and mask for DINOv2
+        feat = extractor.extract_masked_patch_tokens(gal_t.to(device), gmsk_t.to(device))[0]  
+        features.append( t2np(feat) )
+
+    # dimension reduction using PCA
+    sample_ratio = 0.1  # 전체 토큰의 10%만 사용하여 PCA 피팅
+    sampled_tokens = []
+    for tokens in features:
+        num_samples = max(1, int(len(tokens) * sample_ratio))
+        indices = np.random.choice(len(tokens), num_samples, replace=False)
+        sampled_tokens.append(tokens[indices])
+
+    train_tokens = np.vstack(sampled_tokens) # [N_sampled_total, 384]
+
+    # normalization for cosine similarity
+    train_tokens = train_tokens / np.linalg.norm(train_tokens, axis=1, keepdims=True)
+
+    print(f"PCA 피팅에 사용될 토큰 개수: {train_tokens.shape[0]}")
+    pca = PCA(n_components=64)
+    pca.fit(train_tokens)
+
+    # PCA 모델 저장
+    joblib.dump(pca, str(cache_dir / "dinov2_pca_64.pkl"))
+
+    reduced_gallery_list = [extractor_config["name"]]
+    for tokens in features:
+        tokens_norm = tokens / np.linalg.norm(tokens, axis=1, keepdims=True)
+        tokens_reduced = pca.transform(tokens_norm)
+        tokens_reduced_norm = tokens_reduced / np.linalg.norm(tokens_reduced, axis=1, keepdims=True)
+        
+        reduced_gallery_list.append(tokens_reduced_norm.astype(np.float16))
+        
+    np.savez_compressed( str(cache_dir / "g_masked_features.npz"), *reduced_gallery_list)
+    
+    print("Saved DINO features")
+    
+    return reduced_gallery_list 
+
+
+def main():    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config', type=str, default="ope_config.json")
+    args = parser.parse_args()
+    config_fn = args.config if Path(args.config).is_file() else "ope_config.json"
+
+    config = load_json(config_fn)
+    
+    obj_config = get_named_config(config["objects"])
+    obj_dir    = get_obj_path(obj_config["name"], "object")    
+
+    gallery_bboxes, masks = run_render_gallery(config)
+    # gallery_bboxes = np.load(Path(obj_dir) / "g_bboxes.npy")
+
+    ext_config = get_named_config(config["feat_extractors"])
+    ext_name   = ext_config["name"]
+
+    print("=" * 60)
+    print(f"  Feature Extractor : {ext_name}") 
+    print(f"  object(cache)_dir : {obj_dir}")  
+    print("=" * 60)
+
+    if ext_name == "DINOv2_MASK":
+        extract_dino_masking_features(gallery_bboxes, masks, ext_config, obj_dir)
+    else:
+        extract_dino_features(gallery_bboxes, ext_config, obj_dir)
 
     print("=" * 60)
     print("[render_gallery.py] Done")
-    print(f"  object_dir : {args.obj_dir}")
     print("=" * 60)
 
 

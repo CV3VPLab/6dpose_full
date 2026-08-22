@@ -249,8 +249,6 @@ def solve_pose_pnp(pts2d, pts3d, K, R0,
     else:
         print(f"  [PnP] Stage 2 refine failed, using Stage 1 result")
 
-    # print(f" [PnP] rvec: {rvec.ravel()}  tvec: {tvec.ravel()}")
-
     R_out, _ = cv2.Rodrigues(rvec)
     t_out = tvec.ravel()
 

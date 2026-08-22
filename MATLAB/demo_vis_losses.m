@@ -2,16 +2,17 @@
 clear all
 close all
 
-pyenv(Version="C:\Users\choik\anaconda3\envs\gsplat\python.exe");
-
-path_res = 'S:\data\output\can_mtdew\result';
+pyenv(Version="C:\Users\admin\anaconda3\envs\pyenv\python.exe");
 
 %%
-imgnum = [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14];
+path_res = 'W:\data\output\can_fanta\result';
 
-for ii = 1:length(imgnum)
-    imgname = sprintf('%05d', imgnum(ii));
-    l = py.numpy.load( fullfile(path_res, [imgname, '_L.npy']), pyargs('allow_pickle', true));
+npy_file_info = dir( fullfile(path_res, '*.npy') );
+nImgs = size(npy_file_info, 1);
+
+for ii = 1:nImgs
+    filepath = fullfile( path_res, npy_file_info(ii).name );
+    l = py.numpy.load( filepath, pyargs('allow_pickle', true) );
     
     losses = [];
     
@@ -19,7 +20,7 @@ for ii = 1:length(imgnum)
         losses = [losses, py_dict_to_struct(l.item(int32(i)))];
     end
     
-    plot_losses(losses)
-    title(imgname)
+    plot_losses(struct2table(losses))
+    title(npy_file_info(ii).name)
 end
 

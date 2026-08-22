@@ -514,47 +514,6 @@ class GaussianRenderer:
         render_mode = "RGB" if render_mode is None else render_mode
 
 
-
-# ──────────────────────────────────────────────────────────
-# Loss: D-SSIM + D-MS-SSIM  (GS-Pose 방식)
-# ──────────────────────────────────────────────────────────
-def rgb_to_gray(x):
-    return 0.299*x[:,0] + 0.587*x[:,1] + 0.114*x[:,2]
-
-def simple_ssim(x, y):
-    xg, yg = rgb_to_gray(x), rgb_to_gray(y)
-    C1, C2 = 0.01**2, 0.03**2
-    mu_x = F.avg_pool2d(xg, 3, 1, 1)
-    mu_y = F.avg_pool2d(yg, 3, 1, 1)
-    sigma_x  = F.avg_pool2d(xg*xg, 3, 1, 1) - mu_x*mu_x
-    sigma_y  = F.avg_pool2d(yg*yg, 3, 1, 1) - mu_y*mu_y
-    sigma_xy = F.avg_pool2d(xg*yg, 3, 1, 1) - mu_x*mu_y
-    num = (2*mu_x*mu_y + C1) * (2*sigma_xy + C2)
-    den = (mu_x**2 + mu_y**2 + C1) * (sigma_x + sigma_y + C2) + 1e-12
-    return (num/den).mean()
-
-def simple_ms_ssim(x, y, levels=3):
-    """간단한 Multi-Scale SSIM (levels개 scale)."""
-    weights = [0.0448, 0.2856, 0.3001][:levels]
-    weights = [w / sum(weights) for w in weights]
-    val = 0.0
-    for i, w in enumerate(weights):
-        if i == len(weights) - 1:
-            val = val + w * simple_ssim(x, y)
-        else:
-            val = val + w * simple_ssim(x, y)
-            x = F.avg_pool2d(x, 2, 2)
-            y = F.avg_pool2d(y, 2, 2)
-    return val
-
-def dssim_loss(render, target):
-    """D-SSIM = 1 - SSIM"""
-    return 1.0 - simple_ssim(render, target)
-
-def dms_ssim_loss(render, target):
-    """D-MS-SSIM = 1 - MS-SSIM"""
-    return 1.0 - simple_ms_ssim(render, target)
-
     
 # ──────────────────────────────────────────────────────────
 # Learning rate scheduler with warmup (cosine annealing)

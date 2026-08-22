@@ -61,6 +61,22 @@ def params_to_K(fx, fy, cx, cy):
     return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
 
+def get_obj_path(obj_name, kind):
+    # kind : {"output", "object", "gallery", "xyz", "model"}
+    if kind == "output":
+        return Path("data/output") / obj_name
+    
+    out_path = Path("data/object") / obj_name
+    if kind == "object":
+        return out_path 
+    
+    return out_path / kind
+    
+
+def get_K_path(config):
+    return Path("data/camera") / config["cam_type"] / config["K_filename"]
+
+
 def search_for_max_iteration(point_cloud_dir: Path):
     iters = []
     for p in point_cloud_dir.iterdir():
@@ -87,3 +103,12 @@ def load_image(path, color=True):
     if img is None:
         raise FileNotFoundError(f"Failed to read image: {path}")
     return img
+
+
+def get_named_config(configSet):
+    configName = configSet["name"]
+    configList = configSet["configs"]
+    for config in configList:
+        if config["name"] == configName:
+            return config        
+    return None

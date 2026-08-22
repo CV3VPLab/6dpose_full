@@ -1,26 +1,41 @@
 {
-    "input_femto_bolt": {
-        "type": "dir",  
-        "name": "00001.jpg",
-        "cam_type": "femto_bolt",
-        "K_filename": "intrinsics_ds.txt"
+    "input": 2,
+    "inputs": [
+        {
+            "type": "dir",            
+            "name": "00001.jpg",
+            "cam_type": "femto_bolt",
+            "K_filename": "intrinsics_ds.txt"
+        },
+        {
+            "type": "dir",  
+            "name": "00001.jpg",
+            "cam_type": "zed",
+            "K_filename": "calibration.json"
+        },
+        {
+            "type": "dir",  
+            "name": "00001.jpg",
+            "cam_type": "zed_m",
+            "K_filename": "calibration.json"
+        }
+    ],    
+    "objects": {
+        "name": "usb_6",
+        "configs": [
+            { "name": "can_fanta",    "params": [0.995, "normal"] },
+            { "name": "can_mtdew",    "params": [0.995, "specular"] },
+            { "name": "can_sprite",   "params": [1.000, "normal"] },
+            { "name": "drill_yellow", "params": [1.000, "normal"] }, 
+            { "name": "usb_1",        "params": [1.000, "normal"] }, 
+            { "name": "usb_4",        "params": [1.000, "normal"] }, 
+            { "name": "usb_5",        "params": [1.000, "normal"] }, 
+            { "name": "usb_6",        "params": [1.020, "normal"] }
+        ]
     },
-    "input_zed_m": {
-        "type": "dir",  
-        "name": "00001.jpg",
-        "cam_type": "zed_m",
-        "K_filename": "calibration.json"
-    },
-    "objects": [["can_mtdew",    0.995, "specular"], 
-                ["can_fanta",    0.995, "specular"], 
-                ["drill_yellow", 1.012, "normal"], 
-                ["usb_4",        1.000, "normal"]]
-    ,
-    "object": 0
-    ,
     "detector": {
         "name": "yolo",
-        "weights": "weights/best_1280_0801.pt",
+        "weights": "weights/best_1280_ht_0810.pt",
         "options": {
             "conf_thr": 0.25,
             "imgsz": 1280
@@ -35,22 +50,45 @@
         }
         
     },
-    "feat_extractor": {
-        "name": "DINOv2",
-        "options": {
-            "model": "dinov2_vits14",
-            "input_size": 224,
-            "onnx": "weights/dino_vits14_224.onnx",
-            "trt_cache_dir": "weights/trt_cache",
-            "warmup": true,
-            "warmup_runs": 1,
-            "require_gpu": true
-        }
-
+    "feat_extractors": { 
+        "name": "DINOv2_MASK",
+        "configs": [ {
+                "name": "DINOv2_MASK",
+                "options": {
+                    "model": "dinov2_vits14",
+                    "input_size": 224,
+                    "onnx": "weights/dino_vits14_224.onnx",
+                    "trt_cache_dir": "weights/trt_cache",
+                    "warmup": true,
+                    "warmup_runs": 1,
+                    "require_gpu": true
+                }
+            }, {
+                "name": "DINOv2_ONNX",
+                "options": {
+                    "model": "dinov2_vits14",
+                    "input_size": 224,
+                    "onnx": "weights/dino_vits14_224.onnx",
+                    "trt_cache_dir": "weights/trt_cache",
+                    "warmup": true,
+                    "warmup_runs": 1,
+                    "require_gpu": true
+                }
+            }, {
+                "name": "DINOv2",
+                "options": {
+                    "model": "dinov2_vits14",
+                    "input_size": 224,
+                    "warmup": true,
+                    "warmup_runs": 1,
+                    "require_gpu": true
+                }
+            }
+        ]
     },
     "matcher": {
         "name": "EDM_TRT",
-        "onnx": "weights/edm_outdoor_w672_h672_topk2469.onnx",
+        "onnx": "weights/edm_outdoor_w672_h672_topk2469_dynamic_batch.onnx",
         "trt_cache_dir": "weights/trt_cache",
         "options": {
             "conf_thr": 0.35,
@@ -76,8 +114,20 @@
             "warmup_steps": 5,
             "early_stop_steps": 20,
             "early_stop_thr": 1e-5
-        },
+        }
+    },
+    "refiner": {
+        "method": "3DGS",
+        "methods": ["3DGS", "RERENDER", "MIXED"],
         "iterations": [[100, 10], [50, 5], [40, 5], [30, 4], [20, 3]]
+    }, 
+    "results": {
+        "comparison": true,
+        "perturbation": false,
+        "loss": true
+    },
+    "gallery": {
+        "save_depth": false
     },
     "comments": [
         "input - type: [file, dir, cam]",   

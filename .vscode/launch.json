@@ -14,6 +14,16 @@
                 "--config", "ope_config.json"
             ]
         },
+        {   "name": "Rendering gallery",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "render_gallery.py",
+            "console": "integratedTerminal",
+            "cwd":"${workspaceFolder}",
+            "args": [
+                "--config", "open_config.json"
+            ]            
+        },
         {
             "name": "Evaluate pose against GT",
             "type": "debugpy",
@@ -67,27 +77,7 @@
                 "--max_elevation_deg", "90",
                 "--preview_size", "900"
             ]
-        },
-        {   "name": "Step 4: Rendering gallery",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "render_gallery.py",
-            "console": "integratedTerminal",
-            "cwd":"${workspaceFolder}",
-            "args": [                
-                "--obj_dir", "data/object/usb_4",
-                "--gallery_pose_json", "data/gallery_poses.json",
-                "--intrinsics_path", "data/camera/zed_m/calibration.json", // "data/camera/femto_bolt/intrinsics_ds.txt",
-                "--width", "1920",
-                "--height", "1080",
-                "--background", "0,0,0",                // black; for pink use "--background", "255,0,255"
-                "--sh_degree", "3",
-                "--gs_mode", "3dgs",
-                "--dino_model", "dinov2_vits14",
-                "--dino_input_size", "224",                
-                "--save_xyz",                           // "--save_depth",
-            ]
-        },
+        },        
         {   "name": "Step 5: Retrieve gallery & Feature Matching",
             "type": "debugpy",
             "request": "launch",

@@ -1,3 +1,4 @@
+import warnings
 import json
 from pathlib import Path
 from typing import List, Tuple
@@ -6,86 +7,64 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torchvision import transforms
+
+from utils.io_utils import ensure_dir
+from utils.general_utils import sync_time
 
 
-def ensure_dir(path):
-    Path(path).mkdir(parents=True, exist_ok=True)
+warnings.filterwarnings("ignore", message="Can't initialize NVML")
 
 
-def save_json(path, data):
-    path = Path(path)
-    ensure_dir(path.parent)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+DINO_MEAN = [0.485, 0.456, 0.406]
+DINO_STD = [0.229, 0.224, 0.225]
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=DINO_MEAN, std=DINO_STD)
+])
 
 
-def load_image(path, color=True):
-    flag = cv2.IMREAD_COLOR if color else cv2.IMREAD_UNCHANGED
-    img = cv2.imread(str(path), flag)
-    if img is None:
-        raise FileNotFoundError(f'Failed to read image: {path}')
-    return img
+def preprocess_for_dinov2(image_uint8: np.ndarray, mask: np.ndarray = None):
+    """
+    Args:
+        image_uint8: [H, W, 3] 형태의 RGB Numpy 배열 (0~255)
+        mask: [H, W] 형태의 마스크 배열 (0 또는 255)
+    """
+    image_tensor = transform(image_uint8).unsqueeze(0)
+    
+    # 4. 마스크 처리 (옵션)
+    mask_tensor = None
+    if mask is not None:
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0)
+        if mask.dtype == np.uint8:
+            mask_tensor = mask_tensor.float() / 255.0
 
+    return image_tensor, mask_tensor
 
-def list_gallery_images(gallery_dir: Path) -> List[Path]:
-    exts = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
-    files = [p for p in sorted(gallery_dir.iterdir()) if p.suffix.lower() in exts]
-    return files
-
-
-def square_pad_resize(img_bgr: np.ndarray, size: int = 224) -> np.ndarray:
-    h, w = img_bgr.shape[:2]
-    side = max(h, w)
-    canvas = np.zeros((side, side, 3), dtype=np.uint8)
-    y0 = (side - h) // 2
-    x0 = (side - w) // 2
-    canvas[y0:y0+h, x0:x0+w] = img_bgr
-    out = cv2.resize(canvas, (size, size), interpolation=cv2.INTER_AREA)
-    return out
-
-
-def make_preview_strip(query_img, gallery_imgs, labels, out_path):
-    thumbs = []
-    q = cv2.resize(query_img, (224, 224), interpolation=cv2.INTER_AREA)
-    cv2.putText(q, 'query', (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
-    thumbs.append(q)
-    for img, label in zip(gallery_imgs, labels):
-        t = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
-        cv2.putText(t, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA)
-        thumbs.append(t)
-    strip = np.concatenate(thumbs, axis=1)
-    ensure_dir(Path(out_path).parent)
-    cv2.imwrite(str(out_path), strip)
-
-
-def build_contact_sheet(items: List[Tuple[np.ndarray, str]], out_path: Path, cols: int = 3, thumb=(320, 180)):
-    if not items:
-        return
-    tw, th = thumb
-    rows = (len(items) + cols - 1) // cols
-    sheet = np.zeros((rows * th, cols * tw, 3), dtype=np.uint8)
-    for i, (img, label) in enumerate(items):
-        r = i // cols
-        c = i % cols
-        t = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
-        cv2.putText(t, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2, cv2.LINE_AA)
-        sheet[r*th:(r+1)*th, c*tw:(c+1)*tw] = t
-    ensure_dir(out_path.parent)
-    cv2.imwrite(str(out_path), sheet)
-
-
-def make_query_vs_best_image(query_crop, best_crop, out_size=320):
-    q = square_pad_resize(query_crop, out_size)
-    b = square_pad_resize(best_crop, out_size)
-    canvas = np.zeros((out_size, out_size * 2, 3), dtype=np.uint8)
-    canvas[:, :out_size] = q
-    canvas[:, out_size:] = b
-
-    cv2.putText(canvas, "query", (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(canvas, "best", (out_size + 12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    return canvas
+  
+def load_extractor(config):
+    options = config['options']
+    if config["name"] == 'DINOv2_ONNX':    
+        sess = load_dino_trt_session(
+            options["onnx"],
+            trt_cache_dir=options.get("trt_cache_dir"),
+            require_gpu=options.get("require_gpu", True),
+        )
+        extractor = DinoV2ExtractorTRT(options["model"], sess)
+        if options.get("warmup", True):
+            t0 = sync_time()
+            side_len = int(options.get("input_size", 224))
+            dummy_rgb = np.zeros((side_len * 2, side_len * 2, 3), dtype=np.uint8)
+            for _ in range(int(options.get("warmup_runs", 1))):
+                extractor.encode_4rgb(dummy_rgb)
+            t1 = sync_time()
+            print(f"  [DINO TRT] Warmup done ({(t1 - t0):.3f}s, runs={options.get('warmup_runs', 1)})")
+        return extractor, options
+    # elif config["name"] == 'DINOv2_MASK':
+    #     return DinoV2Extractor1(options["model"], device='cuda'), options
+    
+    return DinoV2Extractor(options["model"], device='cuda'), options
 
 
 class DinoV2Extractor:
@@ -95,8 +74,7 @@ class DinoV2Extractor:
             from transformers import AutoImageProcessor, AutoModel
         except Exception as e:
             raise ImportError(
-                'transformers is required for step4 DINO retrieval. '\
-                'Install with: pip install transformers'
+                'transformers is required'
             ) from e
 
         hf_name = {
@@ -105,22 +83,17 @@ class DinoV2Extractor:
             'dinov2_vitl14': 'facebook/dinov2-large',
         }.get(model_name, model_name)
 
-        self.processor = AutoImageProcessor.from_pretrained(hf_name)
-        self.model = AutoModel.from_pretrained(hf_name).to(self.device)
+        model_path = Path('../../.cache/huggingface/hub/models--facebook--dinov2-small')
+        downloaded = True if model_path.exists() else False
+        self.processor = AutoImageProcessor.from_pretrained(hf_name, local_files_only=downloaded)
+        self.model = AutoModel.from_pretrained(hf_name, local_files_only=downloaded, output_hidden_states=True).to(self.device)
         self.model.eval()
+        self.patch_size = 14  # DINOv2 모델의 패치 크기 (14x14)
 
     @torch.no_grad()
     def encode_bgr(self, img_bgr: np.ndarray) -> torch.Tensor:
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        inputs = self.processor(images=rgb, return_tensors='pt')
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        out = self.model(**inputs)
-        if hasattr(out, 'pooler_output') and out.pooler_output is not None:
-            feat = out.pooler_output
-        else:
-            feat = out.last_hidden_state[:, 0]
-        feat = F.normalize(feat, dim=-1)
-        return feat.squeeze(0).detach().cpu()
+        return self.encode_rgb(rgb)        
     
     @torch.no_grad()
     def encode_rgb(self, img_rgb: np.ndarray) -> torch.Tensor:
@@ -132,17 +105,91 @@ class DinoV2Extractor:
         else:
             feat = out.last_hidden_state[:, 0]
         feat = F.normalize(feat, dim=-1)
-        return feat.squeeze(0).detach().cpu()
+        return feat.squeeze(0).detach()
     
     @torch.no_grad()
     def encode_4rgb(self, img_rgb: np.ndarray) -> torch.Tensor:
         assert img_rgb.shape[0] == 224 * 2 and img_rgb.shape[1] == 224 * 2, "Input must be 448x448 RGB image containing 4 tiles"
 
-        feat0 = self.encode_rgb(img_rgb[:224, :224])
-        feat1 = self.encode_rgb(img_rgb[:224, 224:])
-        feat2 = self.encode_rgb(img_rgb[224:, :224])
-        feat3 = self.encode_rgb(img_rgb[224:, 224:])
-        return torch.row_stack( (feat0, feat1, feat2, feat3) ).reshape(-1)
+        feat = self.encode_rgb([img_rgb[:224, :224], img_rgb[:224, 224:], img_rgb[224:, :224], img_rgb[224:, 224:]])
+        return feat.reshape(-1)        
+
+    def extract_masked_patch_tokens(
+        self, 
+        images: torch.Tensor, 
+        masks: torch.Tensor, 
+        mask_threshold: float = 0.5
+    ) -> List[torch.Tensor]:
+        """
+        Args:
+            images: [B, 3, H, W] 정규화된 텐서 (H, W는 14의 배수여야 함)
+            masks: [B, 1, H, W] 0~1 사이 마스크 텐서
+            mask_threshold: 패치가 마스크 내부로 간주될 비율 임계값
+            
+        Returns:
+            List of Tensors: 배치 내 각 샘플마다 [N_valid_patches, Hidden_Dim] 형태의 텐서 리스트
+        """
+        B, C, H, W = images.shape
+        grid_h, grid_w = H // self.patch_size, W // self.patch_size
+
+        # 1. Hugging Face AutoModel Forward
+        # outputs.last_hidden_state: [B, 1 + (grid_h * grid_w), D]
+        outputs = self.model(pixel_values=images)
+        
+        # [CLS] 토큰(인덱스 0) 제거 후 순수 공간 패치 토큰만 선택 -> [B, grid_h * grid_w, D]
+        patch_tokens = outputs.hidden_states[9 + 1][:, 1:, :]
+        # patch_tokens = outputs.last_hidden_state[:, 1:, :]
+
+        # 2. 마스크를 패치 그리드 크기(grid_h, grid_w)로 Area Downsampling
+        downsampled_mask = F.adaptive_avg_pool2d(masks, (grid_h, grid_w))  # [B, 1, grid_h, grid_w]
+        downsampled_mask = downsampled_mask.flatten(2).squeeze(1)          # [B, grid_h * grid_w]
+
+        # 3. 마스크 내부 패치들만 추출 및 L2 정규화
+        valid_tokens_list = []
+        for b in range(B):
+            valid_mask = downsampled_mask[b] >= mask_threshold
+            
+            # 마스크 영역이 매우 작아 threshold를 넘는 패치가 없으면 최댓값을 가진 패치 1개 선택
+            if valid_mask.sum() == 0:
+                valid_mask = downsampled_mask[b] >= downsampled_mask[b].max()
+
+            tokens = patch_tokens[b, valid_mask]       # [N_valid, D]
+            tokens = F.normalize(tokens, p=2, dim=-1)  # 코사인 유사도 연산을 위한 L2 정규화
+            valid_tokens_list.append(tokens)
+
+        return valid_tokens_list
+
+    def compute_asymmetric_chamfer_similarity(
+        self, 
+        query_tokens: torch.Tensor, 
+        gallery_tokens_list: List[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        쿼리(가려짐 발생)와 각 갤러리 템플릿(전체 물체) 간 비대칭 챔퍼 유사도 계산
+        
+        S(Q, G) = (1 / |Q|) * sum_{q in Q} max_{g in G} (q · g)
+        
+        Args:
+            query_tokens: [N_q, D] - 쿼리의 유효 패치 토큰
+            gallery_tokens_list: List of [N_g_i, D] - 각 갤러리 템플릿의 유효 패치 토큰 리스트
+            
+        Returns:
+            similarities: [len(gallery_tokens_list)]
+        """
+        scores = []
+        for g_tokens in gallery_tokens_list:
+            # 코사인 유사도 행렬 계산: [N_q, N_g]
+            sim_matrix = torch.matmul(query_tokens, g_tokens.T)
+            
+            # 각 쿼리 패치에 대해 가장 유사한 갤러리 패치의 유사도(Max over Gallery)
+            max_sim_per_query_patch, _ = sim_matrix.max(dim=1)  # [N_q]
+            
+            # 쿼리 패치들에 대한 평균 유사도 (Asymmetric Mean)
+            chamfer_sim = max_sim_per_query_patch.mean()
+            scores.append(chamfer_sim)
+
+        return torch.stack(scores)
+
 
 
 def load_dino_trt_session(onnx_path, trt_cache_dir=None, require_gpu=True):
@@ -150,6 +197,9 @@ def load_dino_trt_session(onnx_path, trt_cache_dir=None, require_gpu=True):
     import onnxruntime as ort
 
     _try_preload_ort_gpu_libs()
+
+    so = ort.SessionOptions()
+    so.log_severity_level = 0  # 가장 상세한 로그 출력 (Verbose)
 
     providers = []
     trt_options = {}
@@ -162,7 +212,7 @@ def load_dino_trt_session(onnx_path, trt_cache_dir=None, require_gpu=True):
             'trt_profile_min_shapes': 'pixel_values:1x3x224x224',
             'trt_profile_opt_shapes': 'pixel_values:1x3x224x224',
             'trt_profile_max_shapes': 'pixel_values:1x3x224x224',
-            'trt_engine_builder_workspace_size': 4294967296
+            'trt_max_workspace_size': 4294967296
         }
     providers.append(("TensorrtExecutionProvider", trt_options))
     providers.append("CUDAExecutionProvider")
@@ -189,8 +239,7 @@ class DinoV2ExtractorTRT:
             from transformers import AutoImageProcessor
         except Exception as e:
             raise ImportError(
-                'transformers is required for DinoV2ExtractorTRT. '
-                'Install with: pip install transformers'
+                'transformers is required'                
             ) from e
 
         hf_name = {
@@ -199,7 +248,9 @@ class DinoV2ExtractorTRT:
             'dinov2_vitl14': 'facebook/dinov2-large',
         }.get(model_name, model_name)
 
-        self.processor = AutoImageProcessor.from_pretrained(hf_name)
+        model_path = Path('../../.cache/huggingface/hub/models--facebook--dinov2-small')
+        downloaded = True if model_path.exists() else False
+        self.processor = AutoImageProcessor.from_pretrained(hf_name, local_files_only=downloaded)
         self._sess = sess
         self._input_name = sess.get_inputs()[0].name
         self.device = "cuda"
@@ -210,15 +261,14 @@ class DinoV2ExtractorTRT:
             feat = torch.from_numpy(outputs[1])
         else:
             feat = torch.from_numpy(outputs[0][:, 0, :])
-        return F.normalize(feat, dim=-1).squeeze(0)
-
+        return F.normalize(feat.cuda(), dim=-1).squeeze(0)
+    
     def encode_bgr(self, img_bgr: np.ndarray) -> torch.Tensor:
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        pixel_values = self.processor(images=rgb, return_tensors="np")["pixel_values"].astype(np.float32)
-        return self._encode_np(pixel_values)
+        return self.encode_rgb(rgb)        
 
     def encode_rgb(self, img_rgb: np.ndarray) -> torch.Tensor:
-        pixel_values = self.processor(images=img_rgb, return_tensors="np")["pixel_values"].astype(np.float32)
+        pixel_values = self.processor(images=img_rgb, do_resize=False, do_center_crop=False, return_tensors="np")["pixel_values"]
         return self._encode_np(pixel_values)
 
     def encode_4rgb(self, img_rgb: np.ndarray) -> torch.Tensor:
@@ -229,117 +279,5 @@ class DinoV2ExtractorTRT:
         feat2 = self.encode_rgb(img_rgb[224:, :224])
         feat3 = self.encode_rgb(img_rgb[224:, 224:])
         return torch.row_stack((feat0, feat1, feat2, feat3)).reshape(-1)
-
-
-def run_step4_dino_retrieval(args):
-    query_path = Path(args.query_masked_path)
-    gallery_dir = Path(args.gallery_dir)
-    out_dir = Path(args.out_dir)
-    ensure_dir(out_dir)
-
-    query_img = load_image(query_path)
-    qbox = compute_nonblack_bbox(query_img, thresh=args.nonblack_thresh)
-    qbox = expand_bbox(qbox, args.crop_margin, query_img.shape[1], query_img.shape[0])
-    query_crop = crop_with_bbox(query_img, qbox)
-    query_in = square_pad_resize(query_crop, args.dino_input_size)
-
-    gallery_files = list_gallery_images(gallery_dir)
-    if not gallery_files:
-        raise FileNotFoundError(f'No gallery images found in: {gallery_dir}')
-
-    extractor = DinoV2Extractor(args.dino_model, device=args.device)
-    qfeat = extractor.encode_bgr(query_in)
-
-    scores = []
-    topk_items = []
-    best_img = None
-    best_score = -1e9
-    best_path = None
-    best_bbox = None
-
-    for gp in gallery_files:
-        img = load_image(gp)
-        gbox = compute_nonblack_bbox(img, thresh=args.nonblack_thresh)
-        gbox = expand_bbox(gbox, args.crop_margin, img.shape[1], img.shape[0])
-        gcrop = crop_with_bbox(img, gbox)
-        gin = square_pad_resize(gcrop, args.dino_input_size)
-        gfeat = extractor.encode_bgr(gin)
-        score = float(torch.dot(qfeat, gfeat).item())
-        record = {
-            'file': gp.name,
-            'path': str(gp),
-            'score_cosine': score,
-            'bbox_xyxy': [int(v) for v in gbox],
-        }
-        scores.append(record)
-        if score > best_score:
-            best_score = score
-            best_img = img
-            best_path = gp
-            best_bbox = gbox
-
-    scores = sorted(scores, key=lambda x: x['score_cosine'], reverse=True)
-    topk = scores[:args.topk]
-
-    topk_gallery_imgs = []
-    topk_sheet_items = []
-    for i, rec in enumerate(topk):
-        img = load_image(rec['path'])
-        topk_gallery_imgs.append(img)
-        topk_sheet_items.append((img, f"#{i+1} {rec['file']} {rec['score_cosine']:.4f}"))
-
-    best_render_out = out_dir / 'best_render.png'
-    cv2.imwrite(str(best_render_out), best_img)
-
-    query_vs_best_out = out_dir / 'query_vs_best.png'
-    best_crop = crop_with_bbox(best_img, best_bbox)
-    make_preview_strip(
-        query_in,
-        [square_pad_resize(best_crop, args.dino_input_size)],
-        [f"best {best_path.name} {best_score:.4f}"],
-        query_vs_best_out,
-    )
-
-    topk_preview_out = out_dir / 'topk_preview.png'
-    build_contact_sheet(topk_sheet_items, topk_preview_out, cols=min(3, args.topk))
-
-    scores_out = out_dir / 'retrieval_scores.json'
-    summary_out = out_dir / 'step4_summary.json'
-    save_json(scores_out, {
-        'stage': 'step4',
-        'sim_method': 'dino',
-        'query_masked_path': str(query_path),
-        'gallery_dir': str(gallery_dir),
-        'dino_model': args.dino_model,
-        'dino_input_size': args.dino_input_size,
-        'nonblack_thresh': args.nonblack_thresh,
-        'crop_margin': args.crop_margin,
-        'num_gallery': len(gallery_files),
-        'best_render': best_path.name,
-        'best_score': best_score,
-        'topk': topk,
-        'all_scores_sorted': scores,
-    })
-    save_json(summary_out, {
-        'stage': 'step4',
-        'status': 'ok',
-        'best_render': best_path.name,
-        'best_score': best_score,
-        'outputs': {
-            'retrieval_scores': str(scores_out),
-            'best_render': str(best_render_out),
-            'query_vs_best': str(query_vs_best_out),
-            'topk_preview': str(topk_preview_out),
-        }
-    })
-
-    print('=' * 60)
-    print('[Step 5] DINO retrieval complete')
-    print(f'  query        : {query_path}')
-    print(f'  gallery_dir   : {gallery_dir}')
-    print(f'  num_gallery   : {len(gallery_files)}')
-    print(f'  best_render   : {best_path.name}')
-    print(f'  best_score    : {best_score:.4f}')
-    print(f'  scores_json   : {scores_out}')
-    print(f'  topk_preview  : {topk_preview_out}')
-    print('=' * 60)
+    
+    

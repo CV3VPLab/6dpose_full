@@ -22,6 +22,24 @@ def T2Rt(T):
     return R, t
 
 
+def Rt_inv_np(Rt):
+    R = Rt[0]
+    t = Rt[1]
+    Ri = R.T
+    ti = - t @ R
+    return Ri, ti
+
+
+def Rt_compose_np(Rt1, Rt2):
+    """Rt_res = Rt2 @ Rt1
+       points are transformed by Rt1 first.
+    """
+    R = Rt2[0] @ Rt1[0]
+    # t = Rt2[0] @ Rt1[1] + Rt2[1]  when t is a column vector
+    t = Rt1[1] @ Rt2[0].T + Rt2[1]
+    return R, t
+
+
 def rotation_matrix_to_quaternion(R):
     R = np.asarray(R, dtype=np.float64)
     tr = np.trace(R)

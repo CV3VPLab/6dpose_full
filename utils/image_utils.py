@@ -14,11 +14,17 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import warnings
 
 from pathlib import Path
-from tqdm import tqdm
+from tqdm.rich import tqdm
+from tqdm import TqdmExperimentalWarning
+
+import joblib
 from .io_utils import load_json
 import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
 
 def mse(img1, img2):
@@ -50,16 +56,16 @@ def compute_bbox(mask: np.ndarray):
     
     x1, x2 = x_indices[0], x_indices[-1] + 1
     y1, y2 = y_indices[0], y_indices[-1] + 1
-    return x1, y1, x2, y2
+    return [x1, y1, x2, y2]
 
 
-def expand_bbox(bbox, margin, w, h):
+def expand_bbox(bbox, margin, w, h): 
     x1, y1, x2, y2 = bbox
     x1 = max(0, x1 - margin)
     y1 = max(0, y1 - margin)
     x2 = min(w, x2 + margin)
     y2 = min(h, y2 + margin)
-    return int(x1), int(y1), int(x2), int(y2)
+    return [int(x1), int(y1), int(x2), int(y2)]
 
 
 def extract_bbox(img: np.ndarray, margin: int, thresh: int = 8):
@@ -108,6 +114,47 @@ def get_bbox_area(bbox):
     return w * h
 
 
+def make_same_sized_stereo_bboxes(bboxes, img_size, min_size):
+    ys = min(bboxes[0][1], bboxes[1][1])
+    ye = max(bboxes[0][3], bboxes[1][3])
+    
+    bboxes[0][1], bboxes[0][3] = ys, ye
+    bboxes[1][1], bboxes[1][3] = ys, ye
+    h = ye - ys
+    bboxes_size = [get_bbox_size(bboxes[i]) for i in range(len(bboxes))]
+    max_side = max(bboxes_size[0][0], bboxes_size[1][0], h, min_size)
+
+    bb0 = square_bbox( bboxes[0], max_side )
+    bb1 = square_bbox( bboxes[1], max_side )
+
+    if bb0[0] < 0:
+        bb0[0:4:2] -= bb0[0]
+        assert bb0[2] <= img_size[1], f"bb0[2] = {bb0[2]} exceeds image width {img_size[1]}"
+    if bb0[1] < 0:
+        bb0[1:4:2] -= bb0[1]
+        assert bb0[3] <= img_size[0], f"bb0[3] = {bb0[3]} exceeds image height {img_size[0]}"
+    if bb1[0] < 0:
+        bb1[0:4:2] -= bb1[0]
+        assert bb1[2] <= img_size[1], f"bb1[2] = {bb1[2]} exceeds image width {img_size[1]}"
+    if bb1[1] < 0:
+        bb1[1:4:2] -= bb1[1]
+        assert bb1[3] <= img_size[0], f"bb1[3] = {bb1[3]} exceeds image height {img_size[0]}"
+    if bb0[2] > img_size[1]:
+        bb0[0:4:2] -= (bb0[2] - img_size[1])
+        assert bb0[0] >= 0, f"bb0[0] = {bb0[0]} is negative after adjustment"
+    if bb0[3] > img_size[0]:
+        bb0[1:4:2] -= (bb0[3] - img_size[0])
+        assert bb0[1] >= 0, f"bb0[1] = {bb0[1]} is negative after adjustment"
+    if bb1[2] > img_size[1]:
+        bb1[0:4:2] -= (bb1[2] - img_size[1])
+        assert bb1[0] >= 0, f"bb1[0] = {bb1[0]} is negative after adjustment"
+    if bb1[3] > img_size[0]:
+        bb1[1:4:2] -= (bb1[3] - img_size[0])
+        assert bb1[1] >= 0, f"bb1[1] = {bb1[1]} is negative after adjustment"
+
+    return [bb0, bb1]
+
+
 def get_max_bbox_size(bboxes):
     bbox_w = np.max( bboxes[:,2] - bboxes[:,0] )
     bbox_h = np.max( bboxes[:,3] - bboxes[:,1] )
@@ -118,7 +165,10 @@ def get_max_bbox_size(bboxes):
 def square_pad_resize(img: np.ndarray, size: int = 224) -> np.ndarray:
     h, w = img.shape[:2]
     side = max(h, w)
-    canvas = np.zeros((side, side, 3), dtype=np.uint8)
+    if img.ndim == 3:
+        canvas = np.zeros((side, side, img.shape[2]), dtype=img.dtype)
+    else:
+        canvas = np.zeros((side, side), dtype=img.dtype)
     y0 = (side - h) // 2
     x0 = (side - w) // 2
     canvas[y0:y0+h, x0:x0+w] = img
@@ -127,10 +177,14 @@ def square_pad_resize(img: np.ndarray, size: int = 224) -> np.ndarray:
 
 
 def zeropad_square(img, side):
-    h, w = img.shape[:2]
+    h, w = img.shape[:2]    # HW (optional C), 
     assert h <= side and w <= side, "Image dimensions should be less than or equal to the specified side length"
     
-    canvas = np.zeros((side, side, 3), dtype=np.uint8)
+    if img.ndim == 3:
+        canvas = np.zeros((side, side, img.shape[2]), dtype=img.dtype)
+    else:
+        canvas = np.zeros((side, side), dtype=img.dtype)
+    
     if not isinstance(side, np.ndarray):
         side = np.array(side)
     pad_hw = side - img.shape[:2]
@@ -228,35 +282,50 @@ def construct_queryInfo(query_img, out_dir):
     }
 
 
-def construct_galleryInfo(out_dir):
-    bboxes_path = out_dir / "g_bboxes.npy"
+def construct_galleryInfo(obj_dir, ext_name):
+    bboxes_path = obj_dir / "g_bboxes.npy"
     assert bboxes_path.exists(), f"Gallery bounding boxes not found at: {bboxes_path}"
     g_bboxes = np.load(str(bboxes_path))
+    bbox_size = get_max_bbox_size(g_bboxes)
     
-    print(f"  DINOv2 cache dir: {out_dir}")
-
-    gallery_feats = np.load( str(out_dir / "g_features.npy") )
-    g_feats = torch.from_numpy(gallery_feats) # (N_gallery, D_feat) tensor
-
     # Cropped gallery images load
     gallery_crops = []
     for idx in tqdm(range(len(g_bboxes)), desc="Loading gallery"):
-        gpath = out_dir / "gallery" / f"{idx:04d}.png"
+        gpath = obj_dir / "gallery" / f"{idx:04d}.png"
         img_rgb = load_rgb(str(gpath))
         gallery_crops.append(img_rgb)
 
-    bbox_size = get_max_bbox_size(g_bboxes)
+    gallery_poses = load_json(obj_dir.parent.parent / "gallery_poses.json")["poses"]
 
-    gallery_poses = load_json(out_dir.parent.parent / "gallery_poses.json")["poses"]
+    print(f"  DINOv2 cache dir : {obj_dir}")
+    print(f"  Feature Extractor: {ext_name}")
 
-    return {
-        "crops": gallery_crops,         # cropped gallery images according to g_bboxes
-        "poses": gallery_poses,
-        "bboxes": g_bboxes,             # all the bounding boxes of gallery renders
-        "bbox_size": bbox_size,         # the union bounding box
-        "feats": g_feats,               # DINOv2 features of gallery crops, used for cosine similarity retrieval 
-        "path": out_dir / "gallery" 
-    }
+    if ext_name == 'DINOv2_MASK':
+        pca = joblib.load(str(obj_dir / "dinov2_pca_64.pkl"))
+        loaded_npz = np.load(str(obj_dir / "g_masked_features.npz"))
+    else:
+        loaded_npz = np.load(str(obj_dir / "g_features.npz"))
+        
+    ext_name_file = str(loaded_npz['arr_0'])
+    assert ext_name == ext_name_file, f"Extractor in config {ext_name} is different from that in file {ext_name_file}"
+    
+    if ext_name == 'DINOv2_MASK':
+        g_feats = [torch.from_numpy(loaded_npz[key]).float().cuda() for key in loaded_npz.files[1:]]
+    else:
+        g_feats = torch.from_numpy(loaded_npz['arr_1']).float().cuda()
+
+    retdict = {
+            "crops": gallery_crops,         # cropped gallery images according to g_bboxes
+            "poses": gallery_poses,
+            "bboxes": g_bboxes,             # all the bounding boxes of gallery renders
+            "bbox_size": bbox_size,         # the union bounding box
+            "feats": g_feats,               # DINOv2 features of gallery crops, used for cosine similarity retrieval          
+            "path": obj_dir / "gallery" 
+        }    
+    if ext_name == 'DINOv2_MASK':
+        retdict["pca"] = pca                # PCA model for DINOv2 features
+
+    return retdict
 
 
 def make_gallery_square(galleryInfo, idx, size):
@@ -324,6 +393,10 @@ def bin_to_color(binimg: np.ndarray, color):
     resimg[:,:,1] = binimg * color[1]
     resimg[:,:,2] = binimg * color[2]
     return resimg
+
+
+def rgb_to_gray(x):
+    return 0.299*x[:,0] + 0.587*x[:,1] + 0.114*x[:,2]
 
 
 def scale_image_draw_maskcontour(img: np.ndarray, scale, mask: np.ndarray, color):
@@ -413,46 +486,6 @@ def erode_binary_tensor(img_tensor, kernel_size=3):
     return eroded_tensor
 
 
-def dice_loss(pred, target, smooth=1e-6):
-    """
-    pred: 모델의 출력값 (Logits). 형태는 보통 (N, C, H, W)
-    target: 정답 레이블 (0 또는 1). 형태는 pred와 동일
-    """
-    pred = pred.contiguous().view(-1)
-    target = target.contiguous().view(-1)
-    
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum()
-    
-    dice_score = (2. * intersection + smooth) / (union + smooth)
-    return 1. - dice_score
 
-
-def iou_loss(pred, target, smooth=1e-6):
-    pred = torch.sigmoid(pred)
-    
-    pred = pred.contiguous().view(-1)
-    target = target.contiguous().view(-1)
-    
-    intersection = (pred * target).sum()
-    total = pred.sum() + target.sum()
-    union = total - intersection # A U B = A + B - (A ∩ B)
-    
-    iou_score = (intersection + smooth) / (union + smooth)
-    return 1. - iou_score
-
-
-def gradient_matching_loss(render_img, query_img, mask=None):
-    if not hasattr(gradient_matching_loss, "filters_x"):
-        device = render_img.device
-        filters_x, filters_y = get_gradient_filters(device)
-        
-    emask = erode_binary_tensor(mask, 3)
-    render_grad_mag = compute_gradients(render_img, filters_x, filters_y)
-    query_grad_mag = compute_gradients(query_img, filters_x, filters_y)
-    
-    mag_loss = F.l1_loss(render_grad_mag * emask, query_grad_mag * emask)    
-
-    return mag_loss
 
 

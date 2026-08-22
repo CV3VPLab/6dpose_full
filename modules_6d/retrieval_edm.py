@@ -69,9 +69,9 @@ def _try_preload_ort_gpu_libs():
         "libcudnn_ops_infer.so.8",
         "libcudnn_cnn_infer.so.8",
         "libcudnn_adv_infer.so.8",
-        "libnvinfer.so.10",
-        "libnvinfer_plugin.so.10",
-        "libnvonnxparser.so.10",
+        "libnvinfer.so.8",
+        "libnvinfer_plugin.so.8",
+        "libnvonnxparser.so.8",
     ]
     for lib_dir in lib_dirs:
         for name in preload_names:
@@ -127,6 +127,9 @@ def load_edm_trt_session(onnx_path, trt_cache_dir=None, require_gpu=True):
     _try_preload_ort_gpu_libs()
     import onnxruntime as ort
 
+    so = ort.SessionOptions()
+    so.log_severity_level = 0  # 가장 상세한 로그 출력 (Verbose)
+
     providers = []
     trt_options = {}
     if trt_cache_dir:
@@ -136,9 +139,9 @@ def load_edm_trt_session(onnx_path, trt_cache_dir=None, require_gpu=True):
             "trt_engine_cache_enable": True,
             "trt_engine_cache_path": str(trt_cache_dir),
             'trt_profile_min_shapes': 'input:1x2x672x672',
-            'trt_profile_opt_shapes': 'input:1x2x672x672',
-            'trt_profile_max_shapes': 'input:1x2x672x672',
-            'trt_engine_builder_workspace_size': 4294967296
+            'trt_profile_opt_shapes': 'input:2x2x672x672',
+            'trt_profile_max_shapes': 'input:4x2x672x672',
+            'trt_max_workspace_size': 4294967296
         }
     providers.append(("TensorrtExecutionProvider", trt_options))
     providers.append("CUDAExecutionProvider")
@@ -222,11 +225,11 @@ def _filter_edm_deploy_output(output, conf_thr, width, height):
     score_keep = np.concatenate([forward_better, ~forward_better], axis=0)
     keep &= score_keep & (pred_score > sigma_thr)
 
-    return (
+    return [
         mkpts0[keep].astype(np.float32),
         mkpts1[keep].astype(np.float32),
         conf[keep].astype(np.float32),
-    )
+    ]
 
 
 def compute_edm_trt_matches(matcher, img0_rgb, img1_rgb, conf_thr=0.5):
@@ -236,4 +239,17 @@ def compute_edm_trt_matches(matcher, img0_rgb, img1_rgb, conf_thr=0.5):
     onnx_input = _image_pair_to_onnx_input(img0_rgb, img1_rgb)
     output = session.run([output_name], {input_name: onnx_input})[0]
     height, width = img0_rgb.shape[:2]
-    return _filter_edm_deploy_output(output, conf_thr, width, height)
+    return _filter_edm_deploy_output(output[0], conf_thr, width, height)
+
+
+def compute_edm_trt_matches_batch(matcher, img0_rgbs, img1_rgbs, conf_thr=0.5):
+    session = matcher["session"]
+    input_name = matcher["input_name"]
+    output_name = matcher["output_name"]
+    onnx_input = [_image_pair_to_onnx_input(img0, img1) for img0, img1 in zip(img0_rgbs, img1_rgbs)]
+    onnx_input = np.concatenate(onnx_input, axis=0)
+    outputs = session.run([output_name], {input_name: onnx_input})[0]
+
+    height, width = img0_rgbs[0].shape[:2]
+    res = [_filter_edm_deploy_output(output, conf_thr, width, height) for output in outputs]
+    return res
