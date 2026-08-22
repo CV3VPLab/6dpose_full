@@ -43,8 +43,9 @@ from utils.io_utils import (
     get_named_config
 )
 from utils.image_utils import (
-    load_rgb, render_to_image,
-    expand_bbox, compute_bbox, make_same_sized_stereo_bboxes, 
+    load_rgb, load_xyz_map, render_to_image,
+    expand_bbox, compute_bbox, 
+    make_stereo_bboxes_same_square_size, make_stereo_bboxes_same_size,
     get_bbox_size, get_bbox_area, square_bbox, 
     crop_with_bbox, square_pad_resize, unmap_to_full_image,     
     make_gallery_square, construct_galleryInfo,
@@ -100,11 +101,6 @@ def init_gaussians(config, ply_path, scale=1.0):
     gaussians.load_ply(ply_path, scale, use_train_test_exp=False)
     gaussians.freeze_except_pose()
     return gaussians
-
-
-def load_xyz_map(xyz_dir, idx):
-    xyz_map_path = xyz_dir / f"{idx:04d}.npy"
-    return np.load(str(xyz_map_path)).astype(np.float64)
 
 
 def load_detector(config):
@@ -538,6 +534,7 @@ def compute_best_matches_from_batch(queries, galleries, matcher):
     nPairs = len(queries)
     assert nPairs == len(galleries)
 
+    # zero-pad for square & resize to the target size
     queries_m   = [square_pad_resize(queries[i],   in_size) for i in range(nPairs)]
     galleries_m = [square_pad_resize(galleries[i], in_size) for i in range(nPairs)]
     
@@ -700,13 +697,10 @@ def get_T0_stereo(query_infos, gallery_info, nets, K, Rt_lr, reproj_thr):
                   query_infos[0]["m_crop"], query_infos[1]["m_crop"],   
                   query_infos[0]["m_crop"], query_infos[1]["m_crop"]]
 
-    for i in range(len(best_inds_l)):
-        gallery_crop_l, g_bbox_ext_l = make_gallery_square(gallery_info, best_inds_l[i], q_crop_size)
-        gallery_crop.append(gallery_crop_l)
-        g_bbox.append(g_bbox_ext_l)
-        gallery_crop_r, g_bbox_ext_r = make_gallery_square(gallery_info, best_inds_r[i], q_crop_size)    
-        gallery_crop.append(gallery_crop_r)
-        g_bbox.append(g_bbox_ext_r)
+    for i in range(len(best_inds)):
+        idx = best_inds[i]
+        gallery_crop.append(gallery_info['crops'][idx])
+        g_bbox.append(gallery_info['bboxes'][idx])
 
     matching_results = compute_best_matches_from_batch(query_crop[:2], gallery_crop[:2], nets[3])
     nMatches = np.array([len(matching_results[i][0]) for i in range(len(matching_results))])
@@ -738,14 +732,13 @@ def get_T0_stereo(query_infos, gallery_info, nets, K, Rt_lr, reproj_thr):
     # matcher input size in the matcher options
     pts0, pts1, conf = unmap_inlier_matches( (mkpts0, mkpts1, conf), 
                                              (q_bbox, g_bbox[best_i]), query_infos[which_query]["mask"] )
-    # match_img = draw_matches_FHD(gallery_crop, query_crop, g_bbox_ext, q_bbox_ext, pts0, pts1, conf, None)
+    # match_img = draw_matches_FHD(gallery_crop[best_i], query_crop[best_i], g_bbox[best_i], q_bbox, pts0, pts1, conf, None)
     
     # Get initial pose using the matched 2D-3D correspondences and PnP
     R_g, t_g = get_gallery_pose(gallery_info["poses"], best_idx)
     g_bbox = gallery_info["bboxes"][best_idx]
 
-    xyz_dir = gallery_info["path"].parent / "xyz"
-    xyz_map = load_xyz_map(xyz_dir, best_idx)
+    xyz_map = gallery_info["xyzs"][best_idx]
     pts2d_xyz = pts1 - [g_bbox[:2]] # cropped coordinates
     
     # PnP using the 3D model (xyz_map, pts2d_xyz) & 2D points of query (pts0)
@@ -2332,8 +2325,8 @@ def estimate_object_pose_stereo(query_imgs, gallery_info, nets,
     q_masks = segment_stereo(query_imgs, q_bboxes, nets[1])
 
     # bounding box size adjustment for stereo images        
-    q_bboxes = [compute_bbox(q_masks[0]), compute_bbox(q_masks[1])] # initial bounding boxes    
-    q_bboxes = make_same_sized_stereo_bboxes(q_bboxes, _IMG_SIZE, _MIN_BBOX_SIZE)    
+    q_bboxes = [expand_bbox(compute_bbox(q_masks[0])), expand_bbox(compute_bbox(q_masks[1]))] # initial bounding boxes    
+    q_bboxes = make_stereo_bboxes_same_size(q_bboxes, _IMG_SIZE)    
 
     # after getting initial (tight) bounding boxes 
     if bSpecularMask:   
@@ -2487,7 +2480,7 @@ def main_object_pose_estimation():
                 [query_img, query_r_img], 
                 gallery_info, nets, gaussian_proxy, K,  
                 (opt_preproc, opt_pnp, opt_render, opt_refiner))
-            R, t, R0, t0, queries, losses, time_proc = res # , t_loss, losses
+            R, t, R0, t0, queries, losses, time_proc = res 
             q_bbox = queries[0]["bbox"]
             q_bbox_r = queries[1]["bbox"]
             

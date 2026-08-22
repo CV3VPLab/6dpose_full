@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
+IMG_W, IMG_H = 1920, 1080
 
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
@@ -59,13 +60,24 @@ def compute_bbox(mask: np.ndarray):
     return [x1, y1, x2, y2]
 
 
-def expand_bbox(bbox, margin, w, h): 
+# default margin is set to 7 which is a half of DINO patch size
+def expand_bbox(bbox, margin=7, w=IMG_W, h=IMG_H): 
     x1, y1, x2, y2 = bbox
     x1 = max(0, x1 - margin)
     y1 = max(0, y1 - margin)
     x2 = min(w, x2 + margin)
     y2 = min(h, y2 + margin)
     return [int(x1), int(y1), int(x2), int(y2)]
+
+
+def expand_bbox_width_to(bbox, widthTarget):
+    ax = widthTarget - (bbox[2] - bbox[0])
+    assert ax >= 0
+    axl = ax // 2
+    axr = ax - axl
+    bbox[0] -= axl
+    bbox[2] += axr
+    return bbox
 
 
 def extract_bbox(img: np.ndarray, margin: int, thresh: int = 8):
@@ -114,7 +126,48 @@ def get_bbox_area(bbox):
     return w * h
 
 
-def make_same_sized_stereo_bboxes(bboxes, img_size, min_size):
+def make_stereo_bboxes_same_size(bboxes, img_size=(IMG_H, IMG_W)):
+    ys = min(bboxes[0][1], bboxes[1][1])
+    ye = max(bboxes[0][3], bboxes[1][3])
+    # ys, ye must be within the image
+    bboxes[0][1], bboxes[0][3] = ys, ye
+    bboxes[1][1], bboxes[1][3] = ys, ye
+
+    bboxes_size = [get_bbox_size(bboxes[i]) for i in range(len(bboxes))]
+    max_side = max(bboxes_size[0][0], bboxes_size[1][0])
+    
+    bb0 = expand_bbox_width_to( bboxes[0], max_side )
+    bb1 = expand_bbox_width_to( bboxes[1], max_side )
+
+    if bb0[0] < 0:
+        bb0[0:4:2] -= bb0[0]
+        assert bb0[2] <= img_size[1], f"bb0[2] = {bb0[2]} exceeds image width {img_size[1]}"
+    if bb0[1] < 0:
+        bb0[1:4:2] -= bb0[1]
+        assert bb0[3] <= img_size[0], f"bb0[3] = {bb0[3]} exceeds image height {img_size[0]}"
+    if bb1[0] < 0:
+        bb1[0:4:2] -= bb1[0]
+        assert bb1[2] <= img_size[1], f"bb1[2] = {bb1[2]} exceeds image width {img_size[1]}"
+    if bb1[1] < 0:
+        bb1[1:4:2] -= bb1[1]
+        assert bb1[3] <= img_size[0], f"bb1[3] = {bb1[3]} exceeds image height {img_size[0]}"
+    if bb0[2] > img_size[1]:
+        bb0[0:4:2] -= (bb0[2] - img_size[1])
+        assert bb0[0] >= 0, f"bb0[0] = {bb0[0]} is negative after adjustment"
+    if bb0[3] > img_size[0]:
+        bb0[1:4:2] -= (bb0[3] - img_size[0])
+        assert bb0[1] >= 0, f"bb0[1] = {bb0[1]} is negative after adjustment"
+    if bb1[2] > img_size[1]:
+        bb1[0:4:2] -= (bb1[2] - img_size[1])
+        assert bb1[0] >= 0, f"bb1[0] = {bb1[0]} is negative after adjustment"
+    if bb1[3] > img_size[0]:
+        bb1[1:4:2] -= (bb1[3] - img_size[0])
+        assert bb1[1] >= 0, f"bb1[1] = {bb1[1]} is negative after adjustment"
+
+    return [bb0, bb1]
+
+
+def make_stereo_bboxes_same_square_size(bboxes, img_size, min_size):
     ys = min(bboxes[0][1], bboxes[1][1])
     ye = max(bboxes[0][3], bboxes[1][3])
     
@@ -123,7 +176,7 @@ def make_same_sized_stereo_bboxes(bboxes, img_size, min_size):
     h = ye - ys
     bboxes_size = [get_bbox_size(bboxes[i]) for i in range(len(bboxes))]
     max_side = max(bboxes_size[0][0], bboxes_size[1][0], h, min_size)
-
+    
     bb0 = square_bbox( bboxes[0], max_side )
     bb1 = square_bbox( bboxes[1], max_side )
 
@@ -255,6 +308,11 @@ def load_bgr(path):
     return img
 
 
+def load_xyz_map(xyz_dir: Path, idx):
+    xyz_map_path = xyz_dir / f"{idx:04d}.npy"
+    return np.load(str(xyz_map_path)).astype(np.float64)
+
+
 def construct_queryInfo(query_img, out_dir):
     q_path = Path(query_img) 
     assert q_path.exists(), print(f"  [ERROR] query image [{query_img}] not found")
@@ -283,6 +341,61 @@ def construct_queryInfo(query_img, out_dir):
 
 
 def construct_galleryInfo(obj_dir, ext_name):
+    bboxes_path = obj_dir / "g_bboxes.npy"
+    assert bboxes_path.exists(), f"Gallery bounding boxes not found at: {bboxes_path}"
+    g_bboxes = np.load(str(bboxes_path))
+    bbox_size = get_max_bbox_size(g_bboxes)
+    
+    gallery_poses = load_json(obj_dir.parent.parent / "gallery_poses.json")["poses"]
+
+    # Cropped gallery images load
+    gallery_crops = []
+    for idx in tqdm(range(len(g_bboxes)), desc="Loading gallery"):
+        gpath = obj_dir / "gallery" / f"{idx:04d}.png"
+        img_rgb = load_rgb(str(gpath))
+        gallery_crops.append(img_rgb)
+
+    # Cropped xyz maps load
+    xyz_dir = obj_dir / "xyz"
+    xyz_crops = []
+    for idx in tqdm(range(len(g_bboxes)), desc="Loading xyz map"):
+        xyz_map = load_xyz_map(xyz_dir, idx)
+        xyz_crops.append(xyz_map)
+    
+
+    print(f"  Loading DINOv2 - cache dir : {obj_dir}")
+    print(f"            Feature Extractor: {ext_name}")
+
+    if ext_name == 'DINOv2_MASK':
+        pca = joblib.load(str(obj_dir / "dinov2_pca_64.pkl"))
+        loaded_npz = np.load(str(obj_dir / "g_masked_features.npz"))
+    else:
+        loaded_npz = np.load(str(obj_dir / "g_features.npz"))
+        
+    ext_name_file = str(loaded_npz['arr_0'])
+    assert ext_name == ext_name_file, f"Extractor in config {ext_name} is different from that in file {ext_name_file}"
+    
+    if ext_name == 'DINOv2_MASK':
+        g_feats = [torch.from_numpy(loaded_npz[key]).float().cuda() for key in loaded_npz.files[1:]]
+    else:
+        g_feats = torch.from_numpy(loaded_npz['arr_1']).float().cuda()
+
+    retdict = {
+            "crops": gallery_crops,         # cropped gallery images according to g_bboxes
+            "xyzs": xyz_crops,
+            "poses": gallery_poses,
+            "bboxes": g_bboxes,             # all the bounding boxes of gallery renders
+            "bbox_size": bbox_size,         # the union bounding box
+            "feats": g_feats,               # DINOv2 features of gallery crops, used for cosine similarity retrieval          
+            "path": obj_dir / "gallery" 
+        }    
+    if ext_name == 'DINOv2_MASK':
+        retdict["pca"] = pca                # PCA model for DINOv2 features
+
+    return retdict
+
+
+def construct_xyzInfo(obj_dir, ext_name):
     bboxes_path = obj_dir / "g_bboxes.npy"
     assert bboxes_path.exists(), f"Gallery bounding boxes not found at: {bboxes_path}"
     g_bboxes = np.load(str(bboxes_path))
