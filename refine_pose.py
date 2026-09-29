@@ -501,6 +501,40 @@ class GaussianRenderer:
             near_plane=0.01, far_plane=100.0, backgrounds=bgs, render_mode=render_mode, packed=False
         )
     
+    def render_stereo_cropped(self, bboxes, render_mode=None):
+        assert hasattr(self, "viewmats")
+        assert hasattr(self, "width")
+        assert hasattr(self, "height")
+        
+        assert self.viewmats.shape[0] == 2        
+        assert bboxes[0][0] >= bboxes[1][0]
+        assert get_bbox_size(bboxes[0]) == get_bbox_size(bboxes[1])
+        
+        _, height = get_bbox_size(bboxes[0])
+        width = bboxes[0][2] - bboxes[1][0]
+        
+        Ks  = self.K_mat.clone()  
+        Ks[:, 0, 2] -= bboxes[1][0]
+        Ks[:, 1, 2] -= bboxes[1][1]      
+        bgs = self.bg
+
+        num_views = 5 if self.perturbation     else 1        
+        num_cams  = 2 if hasattr(self, "R_lr") else 1        
+
+        if num_views*num_cams > 1:
+            Ks = Ks.expand( num_views*num_cams, -1, -1)
+            bgs = bgs.expand( num_views*num_cams, -1)
+
+        render_mode = "RGB" if render_mode is None else render_mode
+        return _rasterize(
+            means = self.get_xyz, quats=self.get_rotation,
+            scales = self.get_scaling, opacities=self.get_opacity.squeeze(-1),
+            colors = self.get_features, viewmats=self.viewmats, Ks=Ks,
+            width = width, height = height,
+            sh_degree = int(self.active_sh_degree),
+            near_plane=0.01, far_plane=100.0, backgrounds=bgs, render_mode=render_mode, packed=False
+        )
+    
     def render_no_grad(self, render_mode=None):
         with torch.no_grad():
             return self.render(render_mode)

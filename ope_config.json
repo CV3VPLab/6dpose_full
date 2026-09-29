@@ -21,16 +21,19 @@
         }
     ],    
     "objects": {
-        "name": "usb_6",
+        "name": "tweezers_pink",
         "configs": [
-            { "name": "can_fanta",    "params": [0.995, "normal"] },
-            { "name": "can_mtdew",    "params": [0.995, "specular"] },
-            { "name": "can_sprite",   "params": [1.000, "normal"] },
-            { "name": "drill_yellow", "params": [1.000, "normal"] }, 
-            { "name": "usb_1",        "params": [1.000, "normal"] }, 
-            { "name": "usb_4",        "params": [1.000, "normal"] }, 
-            { "name": "usb_5",        "params": [1.000, "normal"] }, 
-            { "name": "usb_6",        "params": [1.020, "normal"] }
+            { "name": "can_fanta",       "params": [0.995, "normal", true] },
+            { "name": "can_mtdew",       "params": [0.995, "specular", true] },
+            { "name": "can_narangd",     "params": [1.000, "normal", true] },
+            { "name": "can_sprite",      "params": [1.000, "normal", true] },
+            { "name": "drill_yellow",    "params": [1.000, "normal", false] }, 
+            { "name": "tweezers_silver", "params": [1.000, "normal", false] }, 
+            { "name": "tweezers_pink",   "params": [0.99, "normal", false] }, 
+            { "name": "usb_1",           "params": [1.000, "normal", true] }, 
+            { "name": "usb_2",           "params": [0.98, "normal", true] }, 
+            { "name": "usb_3",           "params": [1.000, "normal", true] },            
+            { "name": "usb_4",           "params": [1.000, "normal", true] }             
         ]
     },
     "detector": {

@@ -270,11 +270,13 @@ def get_specular_mask(img_rgb):
     return mask
 
 
-def apply_mask(image, mask):
+def apply_mask(image, mask, bg=None):
     if mask.dtype != np.uint8:
         mask = (mask > 0).astype(np.uint8) * 255
     out = np.zeros_like(image)
     out[mask > 0] = image[mask > 0]
+    if bg is not None:
+        out[mask == 0] = bg
     return out
 
 
@@ -340,7 +342,7 @@ def construct_queryInfo(query_img, out_dir):
     }
 
 
-def construct_galleryInfo(obj_dir, ext_name):
+def construct_galleryInfo(obj_dir, ext_name, xyz_preload=False):
     bboxes_path = obj_dir / "g_bboxes.npy"
     assert bboxes_path.exists(), f"Gallery bounding boxes not found at: {bboxes_path}"
     g_bboxes = np.load(str(bboxes_path))
@@ -355,14 +357,14 @@ def construct_galleryInfo(obj_dir, ext_name):
         img_rgb = load_rgb(str(gpath))
         gallery_crops.append(img_rgb)
 
-    # Cropped xyz maps load
-    xyz_dir = obj_dir / "xyz"
-    xyz_crops = []
-    for idx in tqdm(range(len(g_bboxes)), desc="Loading xyz map"):
-        xyz_map = load_xyz_map(xyz_dir, idx)
-        xyz_crops.append(xyz_map)
+    if xyz_preload:
+        # Cropped xyz maps load
+        xyz_dir = obj_dir / "xyz"
+        xyz_crops = []
+        for idx in tqdm(range(len(g_bboxes)), desc="Loading xyz map"):
+            xyz_map = load_xyz_map(xyz_dir, idx)
+            xyz_crops.append(xyz_map)
     
-
     print(f"  Loading DINOv2 - cache dir : {obj_dir}")
     print(f"            Feature Extractor: {ext_name}")
 
@@ -376,53 +378,8 @@ def construct_galleryInfo(obj_dir, ext_name):
     assert ext_name == ext_name_file, f"Extractor in config {ext_name} is different from that in file {ext_name_file}"
     
     if ext_name == 'DINOv2_MASK':
-        g_feats = [torch.from_numpy(loaded_npz[key]).float().cuda() for key in loaded_npz.files[1:]]
-    else:
-        g_feats = torch.from_numpy(loaded_npz['arr_1']).float().cuda()
-
-    retdict = {
-            "crops": gallery_crops,         # cropped gallery images according to g_bboxes
-            "xyzs": xyz_crops,
-            "poses": gallery_poses,
-            "bboxes": g_bboxes,             # all the bounding boxes of gallery renders
-            "bbox_size": bbox_size,         # the union bounding box
-            "feats": g_feats,               # DINOv2 features of gallery crops, used for cosine similarity retrieval          
-            "path": obj_dir / "gallery" 
-        }    
-    if ext_name == 'DINOv2_MASK':
-        retdict["pca"] = pca                # PCA model for DINOv2 features
-
-    return retdict
-
-
-def construct_xyzInfo(obj_dir, ext_name):
-    bboxes_path = obj_dir / "g_bboxes.npy"
-    assert bboxes_path.exists(), f"Gallery bounding boxes not found at: {bboxes_path}"
-    g_bboxes = np.load(str(bboxes_path))
-    bbox_size = get_max_bbox_size(g_bboxes)
-    
-    # Cropped gallery images load
-    gallery_crops = []
-    for idx in tqdm(range(len(g_bboxes)), desc="Loading gallery"):
-        gpath = obj_dir / "gallery" / f"{idx:04d}.png"
-        img_rgb = load_rgb(str(gpath))
-        gallery_crops.append(img_rgb)
-
-    gallery_poses = load_json(obj_dir.parent.parent / "gallery_poses.json")["poses"]
-
-    print(f"  DINOv2 cache dir : {obj_dir}")
-    print(f"  Feature Extractor: {ext_name}")
-
-    if ext_name == 'DINOv2_MASK':
-        pca = joblib.load(str(obj_dir / "dinov2_pca_64.pkl"))
-        loaded_npz = np.load(str(obj_dir / "g_masked_features.npz"))
-    else:
-        loaded_npz = np.load(str(obj_dir / "g_features.npz"))
-        
-    ext_name_file = str(loaded_npz['arr_0'])
-    assert ext_name == ext_name_file, f"Extractor in config {ext_name} is different from that in file {ext_name_file}"
-    
-    if ext_name == 'DINOv2_MASK':
+        g_feats = [loaded_npz[key] for key in loaded_npz.files[1:]]
+        index, image_ids = build_bovw_index(g_feats, 500)
         g_feats = [torch.from_numpy(loaded_npz[key]).float().cuda() for key in loaded_npz.files[1:]]
     else:
         g_feats = torch.from_numpy(loaded_npz['arr_1']).float().cuda()
@@ -437,8 +394,89 @@ def construct_xyzInfo(obj_dir, ext_name):
         }    
     if ext_name == 'DINOv2_MASK':
         retdict["pca"] = pca                # PCA model for DINOv2 features
+        retdict["bovw_index"] = index
+        retdict["bovw_image_ids"] = image_ids
+    if xyz_preload:
+        retdict["xyzs"] = xyz_crops
 
     return retdict
+
+
+import faiss
+def build_bovw_index(gallery_tokens_list, num_visual_words=1000):
+    """
+    갤러리 패치들을 K-Means로 군집화하여 BoVW(Inverted File) 인덱스를 구축합니다.
+    
+    Args:
+        gallery_tokens_list: 각 갤러리 이미지의 패치 토큰 리스트 [N_g, 64]
+        num_visual_words: 클러스터(Visual Word)의 개수 (보통 갤러리 패치 총 개수의 제곱근 수준으로 설정)
+    """
+    # 1. 전체 갤러리 패치를 하나의 거대한 2D 배열로 병합 (FAISS 학습용)
+    all_gallery_tokens = np.vstack(gallery_tokens_list).astype(np.float32)
+    feature_dim = all_gallery_tokens.shape[1] # 예: 64차원 (PCA 적용 후)
+    
+    # 2. 어떤 패치가 어떤 갤러리 이미지(ID)에서 왔는지 추적하기 위한 매핑 배열
+    image_ids = []
+    for img_idx, tokens in enumerate(gallery_tokens_list):
+        image_ids.extend([img_idx] * len(tokens))
+    image_ids = np.array(image_ids)
+
+    # 3. FAISS IVFFlat 인덱스 생성 (BoVW의 핵심)
+    # METRIC_INNER_PRODUCT를 사용하려면 벡터들이 미리 L2 정규화 되어 있어야 합니다.
+    quantizer = faiss.IndexFlatIP(feature_dim) 
+    index = faiss.IndexIVFFlat(quantizer, feature_dim, num_visual_words, faiss.METRIC_INNER_PRODUCT)
+    res = faiss.StandardGpuResources()  # GPU 연산을 위한 메모리 리소스 객체 생성
+    gpu_id = 0                          # 사용할 GPU 번호
+    gpu_index = faiss.index_cpu_to_gpu(res, gpu_id, index)
+
+    # 4. K-Means 군집화를 통해 Visual Word(Centroid) 학습
+    print(f"Visual Words (K-Means) 학습 중... (토큰 개수: {len(all_gallery_tokens)})")
+    gpu_index.train(all_gallery_tokens)
+
+    # 5. 각 패치를 가장 가까운 Visual Word의 서랍(Inverted List)에 넣기
+    gpu_index.add(all_gallery_tokens)
+    print("BoVW 인덱스 구축 완료!")
+    
+    return gpu_index, image_ids
+
+
+def fast_asymmetric_chamfer_search(index, image_ids, query_tokens, num_galleries, top_k_patches=10):
+    """
+    쿼리 패치를 BoVW 인덱스에 검색하여 Asymmetric Chamfer 점수를 고속으로 근사합니다.
+    
+    Args:
+        query_tokens: 쿼리 이미지의 마스킹된 패치 토큰 [N_q, 64]
+        top_k_patches: 각 쿼리 패치당 찾아볼 가장 유사한 갤러리 패치 개수
+    """
+    query_tokens = query_tokens.astype(np.float32)
+    num_query_patches = len(query_tokens)
+    
+    # nprobe: 검색할 주변 Visual Word의 개수 (높일수록 속도 저하, 정확도 상승)
+    index.nprobe = 10 
+    
+    # 1. 쿼리의 각 패치에 대해 가장 유사한 갤러리 패치 Top-K를 탐색 (압도적으로 빠름)
+    similarities, neighbor_indices = index.search(query_tokens, top_k_patches)
+
+    # 2. Asymmetric Chamfer Matching 점수 집계 (MaxSim)
+    # image_patch_sims[img_idx, q_idx]: img_idx 갤러리가 q_idx 쿼리 패치에 대해 가지는 최고 유사도
+    image_patch_sims = np.zeros((num_galleries, num_query_patches))
+    
+    for q_idx in range(num_query_patches):
+        for rank in range(top_k_patches):
+            patch_idx = neighbor_indices[q_idx, rank]
+            sim = similarities[q_idx, rank]
+            
+            if patch_idx != -1: # 유효한 검색 결과인 경우
+                img_idx = image_ids[patch_idx]
+                # 하나의 갤러리 이미지에서 여러 패치가 검색될 수 있으므로 최댓값만 유지
+                if sim > image_patch_sims[img_idx, q_idx]:
+                    image_patch_sims[img_idx, q_idx] = sim
+                    
+    # 3. 쿼리 패치들에 대한 평균 유사도 계산 (전체 패치 수로 나눔)
+    # 발견되지 않은 매칭(0)도 평균에 페널티로 작용하도록 sum 후 len으로 나눔
+    final_scores = np.sum(image_patch_sims, axis=1) / num_query_patches
+    
+    return final_scores
 
 
 def make_gallery_square(galleryInfo, idx, size):

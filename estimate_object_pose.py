@@ -181,7 +181,7 @@ def get_query_paths(config):
     if config_input["type"] == "file":
         return [file_path / config_input["name"]]
     elif config_input["type"] == "dir":
-        qpaths = [f for f in file_path.iterdir() if f.is_file()]
+        qpaths = [f for f in file_path.iterdir() if f.is_file() and f.suffix == '.png']        
         qpaths.sort()
         return qpaths
     else:
@@ -461,8 +461,8 @@ def retrieve_topk(queryInfo, galleryInfo, extractor, k=3):
 # Asymmetric Patch-level Chamfer Matching 
 def retrieve_APCM_topk(queryInfo, galleryInfo, extractor, k=3):    
     g_feats = galleryInfo["feats"]
-    g_bbox_size = galleryInfo["bbox_size"]
-
+    
+    # time_ = []
     # A cropped query image for extracting DINOv2 feature
     ext_net  = extractor[0]
     ext_opts = extractor[1]
@@ -470,20 +470,48 @@ def retrieve_APCM_topk(queryInfo, galleryInfo, extractor, k=3):
     
     query_dino_in = square_pad_resize(queryInfo["m_crop"], dino_size * 2)
     q_mask        = square_pad_resize(queryInfo["c_mask"], dino_size * 2)
+    # time_.append(sync_time())
 
     q_t, qmsk_t = preprocess_for_dinov2(query_dino_in, q_mask)  # Preprocess the image and mask for DINOv2
     q_tokens = ext_net.extract_masked_patch_tokens(q_t.to('cuda'), qmsk_t.to('cuda'))[0]
     q_tokens = F.normalize(q_tokens, p=2, dim=1)
+    # time_.append(sync_time())
 
     pca = galleryInfo["pca"]
     query_reduced_np = pca.transform(q_tokens.detach().cpu().numpy())
     query_reduced = torch.from_numpy(query_reduced_np).float().cuda()
     query_reduced = F.normalize(query_reduced, p=2, dim=1)
-    
+    # time_.append(sync_time())
+
     scores = ext_net.compute_asymmetric_chamfer_similarity(query_reduced, g_feats)        
     topk_values, topk_indices = torch.topk(scores, k=k)
+    # time_.append(sync_time())
 
     return t2np(topk_indices), topk_values
+
+
+from utils.image_utils import fast_asymmetric_chamfer_search
+def retrieve_fast_APCM_topk(queryInfo, galleryInfo, extractor, k=3):    
+    # A cropped query image for extracting DINOv2 feature
+    ext_net  = extractor[0]
+    ext_opts = extractor[1]
+    dino_size = ext_opts["input_size"]
+    
+    query_dino_in = square_pad_resize(queryInfo["m_crop"], dino_size * 2)
+    q_mask        = square_pad_resize(queryInfo["c_mask"], dino_size * 2)
+    
+    q_t, qmsk_t = preprocess_for_dinov2(query_dino_in, q_mask)  # Preprocess the image and mask for DINOv2
+    q_tokens = ext_net.extract_masked_patch_tokens(q_t.to('cuda'), qmsk_t.to('cuda'))[0]
+    q_tokens = F.normalize(q_tokens, p=2, dim=1)
+    
+    pca = galleryInfo["pca"]
+    query_reduced_np = pca.transform(q_tokens.detach().cpu().numpy())
+    scores = fast_asymmetric_chamfer_search(galleryInfo['bovw_index'], 
+                                            galleryInfo['bovw_image_ids'], 
+                                            query_reduced_np, 
+                                            len(galleryInfo["crops"]), top_k_patches=20)
+    topk_indices = np.argsort(scores)[::-1][:k]
+    return topk_indices
 
 
 def compute_matches(query, gallery, matcher):
@@ -680,9 +708,14 @@ def get_T0_stereo(query_infos, gallery_info, nets, K, Rt_lr, reproj_thr):
     if not hasattr(get_T0_stereo, "R_rl"):
         get_T0_stereo.Rt_rl = Rt_inv_np(Rt_lr)
 
-    best_inds_l, score_l = retrieve_APCM_topk(query_infos[0], gallery_info, nets[2])
-    best_inds_r, score_r = retrieve_APCM_topk(query_infos[1], gallery_info, nets[2])
+    # time_ = []
+    # time_.append( sync_time() ) 
+    # best_inds_l, _ = retrieve_APCM_topk(query_infos[0], gallery_info, nets[2])
+    # best_inds_r, _ = retrieve_APCM_topk(query_infos[1], gallery_info, nets[2])
+    best_inds_l = retrieve_fast_APCM_topk(query_infos[0], gallery_info, nets[2])
+    best_inds_r = retrieve_fast_APCM_topk(query_infos[1], gallery_info, nets[2])
     assert len(best_inds_l) == len(best_inds_r) == 3
+    # time_.append( sync_time() )
 
     # prepare the references for matcher
     nMatches = 0 
@@ -704,7 +737,8 @@ def get_T0_stereo(query_infos, gallery_info, nets, K, Rt_lr, reproj_thr):
 
     matching_results = compute_best_matches_from_batch(query_crop[:2], gallery_crop[:2], nets[3])
     nMatches = np.array([len(matching_results[i][0]) for i in range(len(matching_results))])
-    
+    # time_.append( sync_time() )
+
     # 2 galleries : 630 ms, 6 galleries : 690 ms  for USB 4
     if nMatches.max() > 100:
         best_i = nMatches.argmax()
@@ -722,7 +756,8 @@ def get_T0_stereo(query_infos, gallery_info, nets, K, Rt_lr, reproj_thr):
     conf_thr = nets[3]["options"]["conf_thr"]
     idx_clr = 'cyan' if best_i < 2 else 'red'
     print(f"  [{matcher_name}] best matches after conf>={conf_thr}: {len(conf)} points, index [{idx_clr}]{best_i}[/{idx_clr}] in gallery {nMatches}")
-    print(f"                 with avg. conf {avg_confs}")
+    print(f"                   with avg. conf {avg_confs}")
+    # time_.append( sync_time() )
 
     which_query = 0 if best_i % 2 == 0 else 1
     best_idx = best_inds[best_i]
@@ -736,10 +771,15 @@ def get_T0_stereo(query_infos, gallery_info, nets, K, Rt_lr, reproj_thr):
     
     # Get initial pose using the matched 2D-3D correspondences and PnP
     R_g, t_g = get_gallery_pose(gallery_info["poses"], best_idx)
+    
     g_bbox = gallery_info["bboxes"][best_idx]
-
-    xyz_map = gallery_info["xyzs"][best_idx]
     pts2d_xyz = pts1 - [g_bbox[:2]] # cropped coordinates
+
+    if 'xyzs' in gallery_info:
+        xyz_map = gallery_info["xyzs"][best_idx]
+    else:
+        xyz_dir = gallery_info['path'].parent / "xyz"
+        xyz_map = load_xyz_map( xyz_dir, best_idx )
     
     # PnP using the 3D model (xyz_map, pts2d_xyz) & 2D points of query (pts0)
     # t0 : a row vector
@@ -749,6 +789,72 @@ def get_T0_stereo(query_infos, gallery_info, nets, K, Rt_lr, reproj_thr):
     )
     if which_query == 1:
         R0, t0 = Rt_compose_np((R0, t0), get_T0_stereo.Rt_rl)
+
+    # time_.append( sync_time() )
+    # t = np.array(time_)
+
+    return R0, t0, which_query
+
+
+def get_T0_stereo2(query_infos, gallery_info, nets, K, Rt_lr, reproj_thr):
+    if not hasattr(get_T0_stereo, "R_rl"):
+        get_T0_stereo.Rt_rl = Rt_inv_np(Rt_lr)
+
+    time_ = []
+    time_.append(sync_time())
+    best_inds, score_l = retrieve_APCM_topk(query_infos[0], gallery_info, nets[2], 1)
+    best_inds, score_l = retrieve_APCM_topk(query_infos[1], gallery_info, nets[2], 1)
+    
+    time_.append(sync_time())
+    gallery_crop, g_bbox = [], []
+    query_crop = [query_infos[0]["m_crop"], query_infos[0]["m_crop"]]
+
+    best_idx = best_inds[0]
+    gallery_crop.append(gallery_info['crops'][best_idx])
+    g_bbox.append(gallery_info['bboxes'][best_idx])
+    gallery_crop.append(gallery_info['crops'][best_idx])
+    g_bbox.append(gallery_info['bboxes'][best_idx])
+
+    matching_results = compute_best_matches_from_batch(query_crop, gallery_crop, nets[3])
+    
+    time_.append(sync_time())
+
+    mkpts0, mkpts1, conf = matching_results[0]
+    matcher_name = nets[3]['name']
+    conf_thr = nets[3]["options"]["conf_thr"]
+    print(f"  [{matcher_name}] best matches after conf>={conf_thr}: {len(conf)} points, index {best_idx} in gallery")
+    
+    which_query = 0 
+    
+    q_bbox = query_infos[which_query]["bbox"]    
+
+    # matcher input size in the matcher options
+    pts0, pts1, conf = unmap_inlier_matches( (mkpts0, mkpts1, conf), 
+                                             (q_bbox, g_bbox[0]), query_infos[which_query]["mask"] )
+    # match_img = draw_matches_FHD(gallery_crop[best_i], query_crop[best_i], g_bbox[best_i], q_bbox, pts0, pts1, conf, None)
+    
+    # Get initial pose using the matched 2D-3D correspondences and PnP
+    R_g, t_g = get_gallery_pose(gallery_info["poses"], best_idx)
+    
+    g_bbox = gallery_info["bboxes"][best_idx]
+    pts2d_xyz = pts1 - [g_bbox[:2]] # cropped coordinates
+
+    if 'xyzs' in gallery_info:
+        xyz_map = gallery_info["xyzs"][best_idx]
+    else:
+        xyz_dir = gallery_info['path'].parent / "xyz"
+        xyz_map = load_xyz_map( xyz_dir, best_idx )
+    
+    # PnP using the 3D model (xyz_map, pts2d_xyz) & 2D points of query (pts0)
+    # t0 : a row vector
+    R0, t0, pts3d, reproj_err, inlier_idx, match_counts = get_initial_pose(
+        xyz_map, pts2d_xyz, pts0, conf, 
+        K, R_g, reproj_thr
+    )
+    if which_query == 1:
+        R0, t0 = Rt_compose_np((R0, t0), get_T0_stereo.Rt_rl)
+    time_.append(sync_time())
+    t = np.array(time_)
 
     return R0, t0, which_query
 
@@ -1064,10 +1170,12 @@ def refine_pose_stereo_GS(query_infos, gProxy:GaussianRenderer, options):
     
     # crop the mask and masked query image for the refinement step
     # c_ : cropped, m_ : masked
-    query_l["c_mask"] = np2t(query_infos[0]["c_mask"] / 255.0)
-    query_r["c_mask"] = np2t(query_infos[1]["c_mask"] / 255.0)
-    query_l["m_crop"] = np2t(query_infos[0]["m_crop"] / 255.0)
-    query_r["m_crop"] = np2t(query_infos[1]["m_crop"] / 255.0)
+    query_l["m_crop"] = np2t(query_infos[0]["m_crop"]) / 255.0
+    query_r["m_crop"] = np2t(query_infos[1]["m_crop"]) / 255.0
+    query_l["c_mask"] = np2t(query_infos[0]["c_mask"]) / 255.0
+    query_r["c_mask"] = np2t(query_infos[1]["c_mask"]) / 255.0
+
+    R0, t0 = gProxy.get_T()
 
     # ──────────────────────────────────────────────────────
     # 4. Optimization
@@ -1086,9 +1194,7 @@ def refine_pose_stereo_GS(query_infos, gProxy:GaussianRenderer, options):
         warmup_steps = options["warmup_steps"],
         max_lr       = options["lr_rot"],
         min_lr       = options["lr_rot"] * 0.01,
-    )
-
-    R0, t0 = gProxy.get_T()
+    )    
 
     losses_hist = []
     best_loss  = 1e9
@@ -1096,8 +1202,8 @@ def refine_pose_stereo_GS(query_infos, gProxy:GaussianRenderer, options):
 
     ecc_loss_fn = ECCLoss()
 
-    qm_tensors = torch.stack((query_l["c_mask"], query_r["c_mask"]))
     q_tensors = torch.stack((query_l["m_crop"], query_r["m_crop"]))
+    qm_tensors = torch.stack((query_l["c_mask"], query_r["c_mask"]))
 
     for it in range(options["iters"]):
         optimizer.zero_grad()
@@ -1111,19 +1217,27 @@ def refine_pose_stereo_GS(query_infos, gProxy:GaussianRenderer, options):
 
         # full resolution render with identity cam (gsplat)
         gProxy.set_T(R_cur, t_cur)
-        _r, _a, _ = gProxy.render()
+
+        _r, _a, _ = gProxy.render_stereo_cropped([bbox_l, bbox_r])
+        bbox_l = np.array(bbox_l)
+        bbox_r = np.array(bbox_r)
+        bbox_l[0::2] -= bbox_r[0]
+        bbox_r[0::2] -= bbox_r[0]
+        bbox_l[1::2] -= bbox_r[1]
+        bbox_r[1::2] -= bbox_r[1]
 
         render_l_f = _r[0].permute(2,0,1).clamp(0,1)
         render_r_f = _r[1].permute(2,0,1).clamp(0,1)        
-        render_l["crop"] = crop_chw_with_bbox(render_l_f, render_l["bbox"])
-        render_r["crop"] = crop_chw_with_bbox(render_r_f, render_r["bbox"])
-        render_l["c_mask"] = crop_with_bbox((_a[0].squeeze() > 0.5).float(), render_l["bbox"])
-        render_r["c_mask"] = crop_with_bbox((_a[1].squeeze() > 0.5).float(), render_r["bbox"])
+        render_l["crop"] = crop_chw_with_bbox(render_l_f, bbox_l)
+        render_r["crop"] = crop_chw_with_bbox(render_r_f, bbox_r)
+        render_l["c_mask"] = crop_with_bbox(_a[0].squeeze(), bbox_l)
+        render_r["c_mask"] = crop_with_bbox(_a[1].squeeze(), bbox_r)        
         rm_tensors = torch.stack((render_l["c_mask"], render_r["c_mask"]))
 
         losses = {}        
         # 1. Silhouette (Mask) Loss - render_crop:chw, query_mask: hw
-        losses["mask"] = dice_loss( rm_tensors, qm_tensors )
+        # batch processing is 21% faster than individual processing in dice loss calc.
+        losses["mask"] = dice_loss( rm_tensors, qm_tensors )        
 
         render_ci_mask = erode_binary_tensor(rm_tensors, 3) * qm_tensors
         render_l["mi_crop"] = render_l["crop"] * render_ci_mask[0] 
@@ -1152,13 +1266,17 @@ def refine_pose_stereo_GS(query_infos, gProxy:GaussianRenderer, options):
         weight_ssim = 0.1 + 0.9 * progress          # 0.1에서 1.0으로 서서히 증가
         weight_l1   = 2.5                           # 기본 위치 유지를 위해 고정ge
         weight_mask = 1.0                           # 크기 유지를 위해 고정
+        
+        losses["mask"] *= 5
+        losses["ecc"]  *= 4
+        losses["grad"] *= 10        
+        losses["blur"] *= 2.5
 
-        losses["ecc"] *= 2
-        losses["grad"] *= 4        
-        losses["blur"] *= 5        
-        loss = losses["ecc"] + losses["grad"] 
-        loss += losses["mask"]
-        loss += weight_l1 * loss_l1_rgb + loss_ssim
+        loss = losses["mask"]
+        loss += losses["ecc"] 
+        loss += losses["grad"]         
+        loss += weight_l1 * loss_l1_rgb 
+        loss += loss_ssim
         loss += weight_blur * losses["blur"]
         loss.backward() # loss-based gradient calculation & backpropagation 
 
@@ -1201,6 +1319,7 @@ def refine_pose_stereo_GS(query_infos, gProxy:GaussianRenderer, options):
                 print(f"  [EarlyStop] iter={it}  grad_norm={recent_grad:.2e}")
                 break
 
+    # print(f"batch time : {np.array(bdicetime).mean()}, normal time : {np.array(dicetime).mean()}")
     # ──────────────────────────────────────────────────────
     # 5. 저장
     # ──────────────────────────────────────────────────────
@@ -2006,9 +2125,7 @@ def refine_pose_stereo_PnP_GS_rerender(query_infos, which_query,
     
     # ndarray
     query_l["m_crop"] = query_infos[0]["m_crop"]
-    query_r["m_crop"] = query_infos[1]["m_crop"]
-    # query_l["m_crop"] = cv2.detailEnhance(query_l["m_crop"], sigma_s=10, sigma_r=0.15) 
-    # query_r["m_crop"] = cv2.detailEnhance(query_r["m_crop"], sigma_s=10, sigma_r=0.15) 
+    query_r["m_crop"] = query_infos[1]["m_crop"]    
     # tensor
     query_l["c_mask"] = np2t(query_infos[0]["c_mask"]) / 255.0    
     query_r["c_mask"] = np2t(query_infos[1]["c_mask"]) / 255.0    
@@ -2092,10 +2209,13 @@ def refine_pose_stereo_PnP_GS_rerender(query_infos, which_query,
         
         # _r has the left & right rendered images    
         # _alpha > 0.5 produces more accurate object masks
-        render_l["crop"] = crop_chw_with_bbox(render_l_chw, render_l["bbox"])
-        render_r["crop"] = crop_chw_with_bbox(render_r_chw, render_r["bbox"])
-        render_l["c_mask"] = crop_with_bbox((_alpha[0].squeeze() > 0.5).float(), render_l["bbox"])
-        render_r["c_mask"] = crop_with_bbox((_alpha[1].squeeze() > 0.5).float(), render_r["bbox"])
+        render_l["crop"] = crop_chw_with_bbox(render_l_chw, bbox_l)
+        render_r["crop"] = crop_chw_with_bbox(render_r_chw, bbox_r)
+        render_l["c_mask"] = crop_with_bbox(_alpha[0].squeeze(), bbox_l)
+        render_r["c_mask"] = crop_with_bbox(_alpha[1].squeeze(), bbox_r)
+
+        rm_tensors = torch.stack((render_l["c_mask"], render_r["c_mask"]))
+
         # eroded cropped mask for gradient matching (use inner edges not outer boundaries (occlusion issue))
         render_l["ec_mask"] = erode_binary_tensor(render_l["c_mask"].unsqueeze(0), 3).squeeze(0)
         render_r["ec_mask"] = erode_binary_tensor(render_r["c_mask"].unsqueeze(0), 3).squeeze(0)
@@ -2105,6 +2225,293 @@ def refine_pose_stereo_PnP_GS_rerender(query_infos, which_query,
         # intersection masked cropped image
         render_l["mi_crop"] = render_l["crop"] * render_l["cif_mask"]        
         render_r["mi_crop"] = render_r["crop"] * render_r["cif_mask"]
+
+        # 4. [핵심] Dynamic Weighting (Coarse-to-Fine)
+        # 초반: Blur 중심 (크게 돌리기) / 후반: SSIM 중심 (칼같이 맞추기)
+        progress = it / it_GS                   # 현재 학습 진행도 (0.0 ~ 1.0)
+        weight_blur = 1.0 * (1.0 - progress)    # 1.0에서 0.0으로 서서히 감소        
+        weight_l1   = 2.5
+
+        loss, loss_sub = calc_losses_GS(
+            [render_l, render_r], [query_l, query_r], weight_blur
+        )
+        loss.backward()
+        nn.utils.clip_grad_norm_([delta_r, delta_t], max_norm=0.1)
+
+        optimizer.step()
+        scheduler.step()
+
+        tracking_loss = loss_sub["ecc"]
+        tracking_loss += loss_sub["ssim"]
+        tracking_loss += loss_sub["grad"]
+        tracking_loss += loss_sub["mask"]
+        tracking_loss += loss_sub["blur"]
+        # tracking_loss += (weight_l1 * loss_sub["l1_rgb"])
+        loss_val = float(tracking_loss.item())
+
+        losses.append({"iter": it * (it_rerender+1), 
+                       "ecc_loss": loss_sub["ecc"].item(), 
+                       "ssim_loss": loss_sub["ssim"].item(),
+                       "grad_loss": loss_sub["grad"].item(), 
+                       "blur_loss": loss_sub["blur"].item(),
+                       "mask_loss": loss_sub["mask"].item(),                    
+                    #    "rgb_loss": loss_sub["l1_rgb"].item(),
+                       "loss": loss_val})
+        
+        # 이제 loss_val이 아닌 tracking_loss 기준으로 최고를 갱신합니다.
+        if loss_val < best_loss:
+            best_loss  = loss_val
+            best_state = {
+                "R": R_cur.detach(),
+                "t": t_cur.detach(),
+                "iter": it,
+                "loss": loss_val,                
+                # "track_loss": tracking_loss
+            }
+
+        # Early stopping removed
+        
+        # rerender
+        R1, t1 = Rt_update(R0, t0, delta_r, delta_t)
+        R1_r = gProxy.R_lr @ R1
+        t1_r = t1 @ gProxy.R_lr.T + gProxy.t_lr 
+
+        gProxy.set_T(R1, t1)
+        _r, _alpha, _ = gProxy.render_no_grad(render_mode="RGB+ED")   
+
+        render_l_chw = _r[0][..., :3].permute(2,0,1).clamp(0.0, 1.0)
+        render_r_chw = _r[1][..., :3].permute(2,0,1).clamp(0.0, 1.0)
+        depth_l_hw = crop_with_bbox(_r[0][..., 3], render_l["bbox"])
+        depth_r_hw = crop_with_bbox(_r[1][..., 3], render_r["bbox"])    
+
+        render_l["crop0"] = crop_with_bbox(render_l_chw, render_l["bbox"])
+        render_l["c_mask"] = crop_with_bbox(_alpha[0].squeeze(), render_l["bbox"])
+        render_l["cif_mask"] = render_l["c_mask"] * query_l["c_mask"]
+        render_l["ci_mask"] = render_l["cif_mask"] > 0.5
+
+        render_r["crop0"] = crop_with_bbox(render_r_chw, render_r["bbox"])
+        render_r["c_mask"] = crop_with_bbox(_alpha[1].squeeze(), render_r["bbox"])
+        render_r["cif_mask"] = render_r["c_mask"] * query_r["c_mask"]
+        render_r["ci_mask"] = render_r["cif_mask"] > 0.5
+
+        # xyz, xyz_colors : tensors
+        # 물체 픽셀별 xyz
+        xyz_l = depth_tensor_to_xyz_map2(depth_l_hw, render_l["ci_mask"], 
+                                        render_l["bbox"][0], render_l["bbox"][1], fx, fy, cx, cy, R1, t1).detach()
+        xyz_r = depth_tensor_to_xyz_map2(depth_r_hw, render_r["ci_mask"], 
+                                        render_r["bbox"][0], render_r["bbox"][1], fx, fy, cx, cy, R1_r, t1_r).detach()
+        
+        # 물체 픽셀별 color
+        xyz_colors_l = render_l["crop0"][:, render_l["ci_mask"]].detach()    
+        xyz_colors_r = render_r["crop0"][:, render_r["ci_mask"]].detach()
+
+        best_loss_in  = 1e9
+        for itr in range(it_rerender):
+            # global iteration
+            itg = it * (it_rerender+1) + itr + 1
+
+            optimizer.zero_grad()
+            
+            R_cur, t_cur = Rt_update(R0, t0, delta_r, delta_t)
+            R_r_cur = gProxy.R_lr @ R_cur
+            t_r_cur = t_cur @ gProxy.R_lr.T + gProxy.t_lr 
+
+            pts2d_l = project_object_points(xyz_l, R_cur, t_cur, K, render_l["bbox"])   
+            sampled_colors_l = F.grid_sample(query_l["m_crop"].unsqueeze(0), pts2d_l.unsqueeze(0).unsqueeze(0),
+                                        mode='bilinear', padding_mode='zeros', align_corners=True)
+            sampled_colors_l = sampled_colors_l.squeeze(0).squeeze(1)
+
+            pts2d_r = project_object_points(xyz_r, R_r_cur, t_r_cur, K, render_r["bbox"])
+            sampled_colors_r = F.grid_sample(query_r["m_crop"].unsqueeze(0), pts2d_r.unsqueeze(0).unsqueeze(0),
+                                        mode='bilinear', padding_mode='zeros', align_corners=True)
+            sampled_colors_r = sampled_colors_r.squeeze(0).squeeze(1)
+            
+            query_l["rm_crop"] = torch.zeros_like(query_l["m_crop"])  # 만약에 query 색으로 재구성된 query. Rt가 잘 맞는다면, query에서 뽑혀진 sampled_colors가 query에 잘 그려짐
+            query_l["rm_crop"][:, render_l["ci_mask"]] = sampled_colors_l
+            query_r["rm_crop"] = torch.zeros_like(query_r["m_crop"])
+            query_r["rm_crop"][:, render_r["ci_mask"]] = sampled_colors_r
+
+            # 초반: Blur 중심 (크게 돌리기) / 후반: SSIM 중심 (칼같이 맞추기)
+            progress = itg / options["iters"]  # 현재 학습 진행도 (0.0 ~ 1.0)
+            weight_blur = 1.0 * (1.0 - progress)                        # 1.0에서 0.0으로 서서히 감소
+            weight_l1   = 2.5
+
+            total_loss, loss_sub = calc_losses_rerender(
+                torch.stack((render_l["crop0"], render_r["crop0"])), 
+                torch.stack((query_l["rm_crop"], query_r["rm_crop"])),
+                [xyz_colors_l, xyz_colors_r], [sampled_colors_l, sampled_colors_r], 
+                torch.stack((render_l["cif_mask"], render_r["cif_mask"])).unsqueeze(1), 
+                weight_blur
+            )
+
+            total_loss.backward()
+
+            nn.utils.clip_grad_norm_([delta_r, delta_t], max_norm=0.1)
+
+            optimizer.step()
+            scheduler.step()
+
+            tracking_loss = loss_sub["ecc"]
+            tracking_loss += loss_sub["ssim"]
+            tracking_loss += loss_sub["grad"]            
+            tracking_loss += loss_sub["blur"]
+            # tracking_loss += (weight_l1 * (loss_l["rgb"]+loss_r["rgb"]))
+            loss_val = float(tracking_loss.item())
+
+            losses.append({"iter": itg, 
+                           "ecc_loss": loss_sub["ecc"].item(), 
+                        "grad_loss": loss_sub["grad"].item(), 
+                        "blur_loss": loss_sub["blur"].item(),                       
+                        "ssim_loss": loss_sub["ssim"].item(),
+                        # "rgb_loss": loss_sub["rgb"].item(),
+                        "loss": loss_val})
+            
+            # print(losses[-1])
+             
+            # 이제 loss_val이 아닌 tracking_loss 기준으로 최고를 갱신합니다.
+            if loss_val < best_loss_in:
+                best_loss_in  = loss_val
+                best_state = {
+                    "R": R_cur.detach(),
+                    "t": t_cur.detach(),
+                    "iter": itg,
+                    "loss": loss_val,                
+                    # "track_loss": tracking_loss
+                }
+
+    # ──────────────────────────────────────────────────────
+    # 5. 저장
+    # ──────────────────────────────────────────────────────
+    best_R = best_state["R"].cpu().numpy().copy()
+    best_t = best_state["t"].cpu().numpy().copy()
+
+    return best_R, best_t, best_state["loss"], (query_l, query_r), losses
+
+
+def refine_pose_stereo_PnP_GS_rerender1(query_infos, which_query,
+                                       gProxy:GaussianRenderer, options, matcher):
+    assert gProxy.perturbation == False, "refine_pose_PnP requires gProxy.perturbation=False"
+
+    device = torch.device('cuda')
+    
+    # query bounding box 
+    bbox_l, bbox_r = query_infos[0]["bbox"], query_infos[1]["bbox"]
+    query_l,  query_r  = {"bbox": bbox_l}, {"bbox": bbox_r}
+    render_l, render_r = {"bbox": bbox_l}, {"bbox": bbox_r}
+    
+    # ndarray
+    query_l["m_crop"] = query_infos[0]["m_crop"]
+    query_r["m_crop"] = query_infos[1]["m_crop"]    
+    # tensor
+    query_l["c_mask"] = np2t(query_infos[0]["c_mask"]) / 255.0    
+    query_r["c_mask"] = np2t(query_infos[1]["c_mask"]) / 255.0    
+    
+    # ──────────────────────────────────────────────────────
+    # re-PnP 
+    # ──────────────────────────────────────────────────────
+    K = gProxy.K_mat.squeeze(0)
+    fx, fy = t2np(K.diag()[:2])
+    cx, cy = t2np(K[:2, 2])
+
+    R_rl = t2np(gProxy.R_lr.T)
+    t_rl = -R_rl @ t2np(gProxy.t_lr)
+    
+    RE_PNP = True
+    if RE_PNP:
+        viewmats = gProxy.viewmats
+        _r, _, _ = gProxy.render_no_grad(render_mode="RGB+ED")
+
+        if which_query == 0:
+            # left
+            bboxes = (render_l["bbox"], query_l["bbox"])
+            rvec_1, tvec_1, n_p1 = solve_renders_PnP(_r[:1], viewmats[:1], query_l["m_crop"], bboxes, t2np(K), matcher)    
+            rvec = rvec_1
+            tvec = tvec_1
+        else:
+            # right
+            bboxes = (render_r["bbox"], query_r["bbox"])
+            rvec_2, tvec_2, n_p2 = solve_renders_PnP(_r[1:], viewmats[1:], query_r["m_crop"], bboxes, t2np(K), matcher)    
+            rvec_2 = cv2.Rodrigues(R_rl @ cv2.Rodrigues(rvec_2)[0])[0]
+            # rvec = (rvec_1 + rvec_2.T) / 2
+            # tvec = (tvec_1 + (R_rl @ t_rl + tvec_2)) / 2
+            rvec = rvec_2
+            tvec = R_rl @ t_rl + tvec_2
+
+        R0, t0 = np2t(cv2.Rodrigues(rvec)[0]), np2t(tvec[0])
+        gProxy.set_T( R0, t0 )
+    else:
+        R0, t0 = gProxy.get_T()
+
+    # ──────────────────────────────────────────────────────
+    # Optimization
+    # ──────────────────────────────────────────────────────
+    query_l["m_crop"] = np2t(query_l["m_crop"]) / 255.0
+    query_r["m_crop"] = np2t(query_r["m_crop"]) / 255.0
+
+    q_tensors = torch.stack((query_l["m_crop"], query_r["m_crop"]))
+    qm_tensors = torch.stack((query_l["c_mask"], query_r["c_mask"]))
+
+    delta_r = torch.zeros(3, device=device, dtype=torch.float32, requires_grad=True)    # rodrigues vector for rotation update
+    delta_t = torch.zeros(3, device=device, dtype=torch.float32, requires_grad=True)    # translation update
+
+    optimizer = torch.optim.AdamW([
+        {"params": [delta_r], "lr": options["lr_rot"]},
+        {"params": [delta_t], "lr": options["lr_trans"]},
+    ])
+
+    scheduler = CosineWarmupScheduler(
+        optimizer,
+        total_steps  = options["iters"],
+        warmup_steps = options["warmup_steps"],
+        max_lr       = options["lr_rot"],
+        min_lr       = options["lr_rot"] * 0.01,
+    )
+
+    losses = []
+    best_loss  = 1e9
+    best_state = { "R": R0.detach(), "t": t0.detach(), "iter": 0 }
+
+    it_rerender = 9
+    it_GS = max(1, int(options["iters"]/(it_rerender+1)))
+
+    for it in range(it_GS):
+        optimizer.zero_grad()
+
+        R_cur, t_cur = Rt_update(R0, t0, delta_r, delta_t)
+        
+        # full resolution render with identity cam (gsplat)
+        gProxy.set_T(R_cur, t_cur)
+        _r, _alpha, _ = gProxy.render_stereo_cropped([bbox_l, bbox_r], render_mode="RGB")      
+        bbox_l = np.array(bbox_l)
+        bbox_r = np.array(bbox_r)
+        bbox_l[0::2] -= bbox_r[0]
+        bbox_r[0::2] -= bbox_r[0]
+        bbox_l[1::2] -= bbox_r[1]
+        bbox_r[1::2] -= bbox_r[1]
+
+        render_l_chw = _r[0].permute(2,0,1).clamp(0.0, 1.0)
+        render_r_chw = _r[1].permute(2,0,1).clamp(0.0, 1.0)
+        
+        # _r has the left & right rendered images    
+        # _alpha > 0.5 produces more accurate object masks
+        render_l["crop"] = crop_chw_with_bbox(render_l_chw, bbox_l)
+        render_r["crop"] = crop_chw_with_bbox(render_r_chw, bbox_r)
+        render_l["c_mask"] = crop_with_bbox(_alpha[0].squeeze(), bbox_l)
+        render_r["c_mask"] = crop_with_bbox(_alpha[1].squeeze(), bbox_r)
+
+        rm_tensors = torch.stack((render_l["c_mask"], render_r["c_mask"]))
+        
+        # eroded cropped mask for gradient matching (use inner edges not outer boundaries (occlusion issue))
+        render_l["ec_mask"] = erode_binary_tensor(render_l["c_mask"].unsqueeze(0), 3).squeeze(0)
+        render_r["ec_mask"] = erode_binary_tensor(render_r["c_mask"].unsqueeze(0), 3).squeeze(0)
+        # intersecion cropped mask
+        render_l["cif_mask"] = render_l["ec_mask"] * query_l["c_mask"]
+        render_r["cif_mask"] = render_r["ec_mask"] * query_r["c_mask"]
+        # intersection masked cropped image
+        render_l["mi_crop"] = render_l["crop"] * render_l["cif_mask"]        
+        render_r["mi_crop"] = render_r["crop"] * render_r["cif_mask"]
+
+        
         
         # 4. [핵심] Dynamic Weighting (Coarse-to-Fine)
         # 초반: Blur 중심 (크게 돌리기) / 후반: SSIM 중심 (칼같이 맞추기)
@@ -2165,14 +2572,14 @@ def refine_pose_stereo_PnP_GS_rerender(query_infos, which_query,
         depth_r_hw = crop_with_bbox(_r[1][..., 3], render_r["bbox"])    
 
         render_l["crop0"] = crop_with_bbox(render_l_chw, render_l["bbox"])
-        render_l["c_mask"] = crop_with_bbox(_alpha[0].squeeze() > 0.5, render_l["bbox"])
-        render_l["ci_mask"] = render_l["c_mask"] & query_l["c_mask"].bool()
-        render_l["cif_mask"] = render_l["ci_mask"].float()
+        render_l["c_mask"] = crop_with_bbox(_alpha[0].squeeze(), render_l["bbox"])
+        render_l["cif_mask"] = render_l["c_mask"] * query_l["c_mask"]
+        render_l["ci_mask"] = render_l["cif_mask"] > 0.5
 
         render_r["crop0"] = crop_with_bbox(render_r_chw, render_r["bbox"])
-        render_r["c_mask"] = crop_with_bbox(_alpha[1].squeeze() > 0.5, render_r["bbox"])
-        render_r["ci_mask"] = render_r["c_mask"] & query_r["c_mask"].bool()
-        render_r["cif_mask"] = render_r["ci_mask"].float()
+        render_r["c_mask"] = crop_with_bbox(_alpha[1].squeeze(), render_r["bbox"])
+        render_r["cif_mask"] = render_r["c_mask"] * query_r["c_mask"]
+        render_r["ci_mask"] = render_r["cif_mask"] > 0.5
 
         # xyz, xyz_colors : tensors
         # 물체 픽셀별 xyz
@@ -2346,22 +2753,24 @@ def estimate_object_pose_stereo(query_imgs, gallery_info, nets,
         "c_mask": crop_with_bbox(q_masks[1], q_bboxes[1]),
         "crop": crop_with_bbox(query_imgs[1], q_bboxes[1])
     }]
-    # add cropped masked query (np.uint8)
-    query_infos[0]["m_crop"] = apply_mask(query_infos[0]["crop"], query_infos[0]["c_mask"])
-    query_infos[1]["m_crop"] = apply_mask(query_infos[1]["crop"], query_infos[1]["c_mask"])
-    
     # background setting for rendering
     bgClr  = np.array(cv2.mean(query_infos[0]["crop"], 255-query_infos[0]["c_mask"]))
     bgClr += np.array(cv2.mean(query_infos[1]["crop"], 255-query_infos[1]["c_mask"]))
     bgClr  = np.round(bgClr[:3] / 2.0)
     gProxy.bg = np2t(bgClr).float() / 255.0
 
+    # add cropped masked query (np.uint8)
+    query_infos[0]["m_crop"] = apply_mask(query_infos[0]["crop"], query_infos[0]["c_mask"])
+    query_infos[1]["m_crop"] = apply_mask(query_infos[1]["crop"], query_infos[1]["c_mask"])
+    
     # Best gallery selection - Feature matching - PnP
     # R0, t0 of left camera
     R0, t0, which_query = get_T0_stereo(query_infos, gallery_info, nets, 
                                         K, estimate_object_pose_stereo.Rt_lr_np, 
                                         opt_pnp["reproj_thr"])
     
+    # query_infos[0]["m_crop"][query_infos[0]["c_mask"] == 0] = bgClr
+    # query_infos[1]["m_crop"][query_infos[1]["c_mask"] == 0] = bgClr
     time_.append( sync_time() )
 
     METHOD = opt_refiner["method"]    
@@ -2374,7 +2783,7 @@ def estimate_object_pose_stereo(query_imgs, gallery_info, nets,
         R, t, t_loss, queries, losses = refine_pose_stereo_rerender(query_infos[0], query_infos[1], 
                                                             gProxy, opt_render, Rt_lr[0], Rt_lr[1])    
     elif METHOD == 'MIXED':
-        R, t, t_loss, queries, losses = refine_pose_stereo_PnP_GS_rerender(query_infos, which_query,
+        R, t, t_loss, queries, losses = refine_pose_stereo_PnP_GS_rerender1(query_infos, which_query,
                                                             gProxy, opt_render, nets[3])
     time_.append( sync_time() )
 
@@ -2396,6 +2805,7 @@ def main_object_pose_estimation():
     obj_config = get_named_config(config["objects"])
     obj_name   = obj_config['name']
     obj_params = obj_config['params']
+    xyz_preload = obj_params[2]
 
     model_dir   = get_obj_path(obj_name, "model")
     obj_dir     = get_obj_path(obj_name, "object")
@@ -2429,7 +2839,7 @@ def main_object_pose_estimation():
     nets = load_networks(config)
     
     ext_config = get_named_config(config['feat_extractors'])
-    gallery_info = construct_galleryInfo(obj_dir, ext_config['name'])
+    gallery_info = construct_galleryInfo(obj_dir, ext_config['name'], xyz_preload)
 
     opt_render = config["renderer"]["options"]
 
@@ -2461,10 +2871,7 @@ def main_object_pose_estimation():
     else:
         idx = range(len(query_paths))
     
-    # idx = range(len(query_paths))
     for i in idx:
-        # if i == 24:
-        #     break
         query_img = load_rgb(query_paths[i])
         assert opt_render["width"] == query_img.shape[1] and opt_render["height"] == query_img.shape[0]
 
@@ -2477,9 +2884,9 @@ def main_object_pose_estimation():
         
         if USE_STEREO:
             res = estimate_object_pose_stereo(
-                [query_img, query_r_img], 
-                gallery_info, nets, gaussian_proxy, K,  
-                (opt_preproc, opt_pnp, opt_render, opt_refiner))
+                                        [query_img, query_r_img], 
+                                        gallery_info, nets, gaussian_proxy, K,  
+                                        (opt_preproc, opt_pnp, opt_render, opt_refiner))
             R, t, R0, t0, queries, losses, time_proc = res 
             q_bbox = queries[0]["bbox"]
             q_bbox_r = queries[1]["bbox"]

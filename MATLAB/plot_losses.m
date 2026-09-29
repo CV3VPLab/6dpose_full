@@ -60,28 +60,24 @@ end
 subplot(3,1,2), legend(labels)
 hold off
 
+
 if fLosses(3)
     subplot(3,1,3), plot(iter, ssim_loss, 'Color', colors{6}, 'LineWidth', 1.5); hold on
     set(gca, 'Color', 'w')
     set(gca, 'XColor', 'k')
-    set(gca, 'YColor', 'k')
-    labels{end+1} = 'ssim';
+    set(gca, 'YColor', 'k')    
 end
 if fLosses(4)
-    subplot(3,1,3), plot(iter, grad_loss, 'Color', colors{4}, 'LineWidth', 1.5);
-    labels{end+1} = 'grad';
+    subplot(3,1,3), plot(iter, grad_loss, 'Color', colors{4}, 'LineWidth', 1.5);    
 end
 if fLosses(5)
-    subplot(3,1,3), plot(iter, blur_loss, 'Color', colors{2}, 'LineWidth', 1.5);
-    labels{end+1} = 'blur';
+    subplot(3,1,3), plot(iter, blur_loss, 'Color', colors{2}, 'LineWidth', 1.5);    
 end
 if fLosses(6)
-    subplot(3,1,3), plot(iter, mask_loss, 'Color', colors{5}, 'LineWidth', 1.5);
-    labels{end+1} = 'mask';
+    subplot(3,1,3), plot(iter, mask_loss, 'Color', colors{5}, 'LineWidth', 1.5);    
 end
 if fLosses(7)
-    subplot(3,1,3), plot(iter, rgb_loss, 'Color', colors{7}, 'LineWidth', 1.5);
-    labels{end+1} = 'rgb';
+    subplot(3,1,3), plot(iter, rgb_loss, 'Color', colors{7}, 'LineWidth', 1.5);    
 end
 subplot(3,1,3), legend(labels(2:end))
 hold off

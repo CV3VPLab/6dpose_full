@@ -1,11 +1,12 @@
 %%
+clc
 clear all
 close all
 
 pyenv(Version="C:\Users\admin\anaconda3\envs\pyenv\python.exe");
 
 %%
-path_res = 'W:\data\output\can_fanta\result';
+path_res = ['W:\data\output\usb_1\result'];
 
 npy_file_info = dir( fullfile(path_res, '*.npy') );
 nImgs = size(npy_file_info, 1);
